@@ -26,9 +26,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      # mythings-core is a sibling repo, not on PyPI — pull it from the same owner.
-      - name: Install mythings-core
-        run: pip install "mythings-core @ git+https://github.com/${{ github.repository_owner }}/mythings-core@main"
+      # my-things-core is a sibling repo, not on PyPI — pull it from the same owner.
+      - name: Install my-things-core
+        run: pip install "my-things-core @ git+https://github.com/${{ github.repository_owner }}/my-things-core@main"
       - name: Install
         run: pip install -e ".[dev]"
       - name: Ruff

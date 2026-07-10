@@ -4,7 +4,7 @@ You are developing **my-coder**, a MyThingsLab My[X] tool.
 
 **Inherited rules:** obey [`./HARNESS.md`](./HARNESS.md) in full — the vendored
 MyThingsLab build-harness rules. Do not restate or override them. Anything not
-covered here defers to `HARNESS.md`, then `mythings-core/docs/CONVENTIONS.md`.
+covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
 
 ## This tool
 
