@@ -1,0 +1,18 @@
+# Local-first gate: the same ruff + pytest CI runs, before a commit lands.
+# Install once with `pre-commit install`.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: ruff check
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: ["src", "tests"]
+      - id: pytest-fast
+        name: pytest (fast)
+        entry: pytest -q -m "not slow"
+        language: system
+        pass_filenames: false
+        always_run: true
