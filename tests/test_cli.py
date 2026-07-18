@@ -58,6 +58,18 @@ def test_build_json_output(capsys):
     assert payload["pr"] == 7
 
 
+def test_build_defaults_to_unguarded(capsys):
+    _, coder, _ = _build(["--repo", "o/r", "--issue", "5"], capsys)
+    assert coder.kwargs["policy"] is None
+
+
+def test_build_guarded_wires_a_myguard_policy(capsys):
+    from myguard.guard import Guard
+
+    _, coder, _ = _build(["--repo", "o/r", "--issue", "5", "--guarded"], capsys)
+    assert isinstance(coder.kwargs["policy"], Guard)
+
+
 def test_build_failure_returns_nonzero(capsys):
     StubCoder.instances = []
 

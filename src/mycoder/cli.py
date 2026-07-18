@@ -7,7 +7,7 @@ from pathlib import Path
 from mythings.github import GitHub
 from mythings.ledger import Ledger
 
-from mycoder.coder import Coder, Result
+from mycoder.coder import Coder, Result, default_guarded_policy
 from mycoder.session import ClaudeSessionRunner, NoopSessionRunner, SessionRunner
 
 
@@ -86,6 +86,13 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         action="store_true",
         help="re-run the target repo's tests in the worktree before opening the PR",
     )
+    build.add_argument(
+        "--guarded",
+        action="store_true",
+        help="gate opening the draft PR through myguard.Guard (real ASK-channel human "
+        "approval via MYTHINGS_ASK_CMD) instead of always allowing it; default stays "
+        "unguarded for a lone invocation",
+    )
     build.add_argument("--ledger", type=Path, default=Path(".mythings/ledger.jsonl"))
     build.add_argument(
         "--transcripts-dir",
@@ -105,6 +112,7 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         github=GitHub(args.repo),
         ledger=Ledger(args.ledger),
         session_runner=_runner(args.session_runner),
+        policy=default_guarded_policy() if args.guarded else None,
         base=args.base,
         run_tests=args.run_tests,
         max_budget_usd=args.max_budget_usd,
