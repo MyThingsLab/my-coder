@@ -77,6 +77,52 @@ class FakeSessionRunner:
         )
 
 
+class SequencedSessionRunner:
+    # Stands in for a session whose behavior differs attempt to attempt (e.g.
+    # a retry that actually fixes what the first attempt got wrong). `steps`
+    # is one files-dict per call; the last step repeats if called more times
+    # than it has steps for.
+    def __init__(self, steps: list[dict[str, str]], *, cost_usd: float = 0.05) -> None:
+        self.steps = steps
+        self.cost_usd = cost_usd
+        self.calls: list[str] = []
+        self._i = 0
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        max_budget_usd: float,
+        max_turns: int,
+        timeout_s: float,
+    ) -> SessionResult:
+        self.calls.append(prompt)
+        files = self.steps[min(self._i, len(self.steps) - 1)]
+        self._i += 1
+        for rel, content in files.items():
+            target = Path(cwd) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True, capture_output=True)
+        # A repeated step (a stuck session re-shown the same state) leaves
+        # nothing new to commit; a real session in that position wouldn't
+        # force an empty commit either.
+        staged = subprocess.run(
+            ["git", "-C", str(cwd), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if staged.strip():
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-m", "session work"],
+                check=True,
+                capture_output=True,
+            )
+        return SessionResult(ok=True, turns=3, cost_usd=self.cost_usd, final_message="done")
+
+
 def _issue(number: int, title: str, body: str = "") -> str:
     return json.dumps(
         [{"number": number, "title": title, "body": body, "url": f"u/{number}", "labels": []}]
@@ -357,3 +403,107 @@ def test_prompt_carries_a_style_anchor_from_existing_code(tmp_path, clean_git_en
     assert "match its conventions" in prompt
     assert "MARKER_SOURCE = 42" in prompt  # existing source content is shown
     assert "src/pkg/thing.py" in prompt  # and the file tree / exemplar header
+
+
+_FIXED_TEST_CMD = [
+    "python",
+    "-c",
+    "import pathlib, sys; sys.exit(0 if pathlib.Path('pkg/fixed.txt').exists() else 1)",
+]
+
+
+def test_build_retries_and_succeeds_on_a_later_attempt(tmp_path, clean_git_env, attended_env):
+    # First attempt fails the test suite and checkpoints; a fresh session on
+    # the second attempt (auto-resumed from that checkpoint) writes the fix
+    # and the build succeeds -- the whole retry loop, in one `run()` call.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "hard"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/20",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = SequencedSessionRunner([{"pkg/a.py": "a = 1\n"}, {"pkg/fixed.txt": "ok\n"}])
+    coder = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_FIXED_TEST_CMD,
+        max_attempts=2,
+    )
+    result = coder.run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 20
+    assert result.attempts == 2
+    assert result.cost_usd == 0.10  # summed across both attempts, not just the last
+    assert len(runner.calls) == 2
+    assert "already carries 1 commit" in runner.calls[1]
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+    assert "ok" in repo.read_committed("mycoder/my-raytracer-5", "pkg/fixed.txt")
+
+
+def test_build_stops_retrying_once_max_attempts_is_reached(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "never fixed")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = SequencedSessionRunner([{"pkg/a.py": "a = 1\n"}])  # never writes fixed.txt
+    coder = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_FIXED_TEST_CMD,
+        max_attempts=3,
+    )
+    result = coder.run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.attempts == 3
+    assert len(runner.calls) == 3
+    assert not gh.saw("pr", "create")
+
+
+def test_build_stops_retrying_when_the_total_budget_is_spent(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "never fixed")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = SequencedSessionRunner([{"pkg/a.py": "a = 1\n"}], cost_usd=1.0)
+    coder = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_FIXED_TEST_CMD,
+        max_attempts=5,
+        max_total_budget_usd=1.0,
+    )
+    result = coder.run(issue_number=5)
+
+    # A single $1 attempt already exhausts a $1 total budget -- no second try
+    # even though max_attempts allows four more.
+    assert result.outcome == "needs_review"
+    assert result.attempts == 1
+    assert len(runner.calls) == 1
+
+
+def test_default_max_attempts_is_one_unchanged_behavior(tmp_path, clean_git_env, attended_env):
+    # No caller opts into retries by accident: the default must reproduce the
+    # old single-shot behavior exactly.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "never fixed")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = SequencedSessionRunner([{"pkg/a.py": "a = 1\n"}])
+    coder = _coder(
+        repo.path, gh, ledger_path, runner, run_tests=True, test_command=_FIXED_TEST_CMD
+    )
+    result = coder.run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.attempts == 1
+    assert len(runner.calls) == 1

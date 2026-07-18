@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -69,7 +69,8 @@ class Result:
     pr: int | None = None
     files_touched: list[str] = field(default_factory=list)
     tests_passed: bool | None = None
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0  # summed across every attempt, not just the last
+    attempts: int = 1
 
 
 class Coder:
@@ -91,6 +92,8 @@ class Coder:
         max_budget_usd: float = 5.0,
         max_turns: int = 60,
         session_timeout_s: float = 1800.0,
+        max_attempts: int = 1,
+        max_total_budget_usd: float | None = None,
         transcripts_dir: Path | None = None,
         git: Callable[[Path, list[str]], str] = _run_git,
         workspace_factory: Callable[..., Workspace] = Workspace,
@@ -111,6 +114,15 @@ class Coder:
         # (--max-budget-usd is the real backstop).
         self.max_turns = max_turns
         self.session_timeout_s = session_timeout_s
+        # Default max_attempts=1 keeps every existing caller's behavior
+        # unchanged; opting into retries is a deliberate choice, not a new
+        # default cost. Retries recycle v0.3's checkpoint branch (same issue,
+        # same worktree state a prior attempt left off at) rather than
+        # redoing work, so a harder issue gets more shots without more waste.
+        self.max_attempts = max(1, max_attempts)
+        self.max_total_budget_usd = (
+            max_total_budget_usd if max_total_budget_usd is not None else max_budget_usd * 3
+        )
         self.transcripts_dir = Path(transcripts_dir) if transcripts_dir else None
         self._git = git
         self._workspace = workspace_factory
@@ -243,6 +255,13 @@ class Coder:
 
     # -- loop ------------------------------------------------------------
 
+    # Outcomes worth a fresh attempt: a checkpointed branch (needs_review) or
+    # a session that left nothing durable (failure) both still have budget
+    # left to try again. denied/no_changes/success/skipped are all a
+    # considered stopping point, not a transient miss -- retrying them either
+    # re-hits the same policy wall or burns money re-confirming a no-op.
+    _RETRYABLE = frozenset({"needs_review", "failure"})
+
     def run(self, issue_number: int) -> Result:
         issue = self.pick_issue(issue_number)
         if issue is None:
@@ -250,6 +269,19 @@ class Coder:
             self._record("skipped", detail, issue=issue_number)
             return Result("skipped", detail, issue=issue_number)
 
+        total_cost = 0.0
+        result = None
+        for attempt in range(1, self.max_attempts + 1):
+            result = self._attempt(issue)
+            total_cost += result.cost_usd
+            done = result.outcome not in self._RETRYABLE or attempt == self.max_attempts
+            done = done or total_cost >= self.max_total_budget_usd
+            if done:
+                break
+        assert result is not None
+        return replace(result, cost_usd=total_cost, attempts=attempt)
+
+    def _attempt(self, issue: Issue) -> Result:
         branch = f"{TOOL}/{self._repo_name()}-{issue.number}"
         # Recycle a prior run's checkpointed commits instead of starting over:
         # if this issue's branch already exists on origin (a previous attempt

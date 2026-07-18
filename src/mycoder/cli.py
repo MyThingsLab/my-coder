@@ -15,6 +15,8 @@ def _render(result: Result) -> str:
     line = f"{result.outcome}: {result.detail}"
     if result.issue is not None:
         line += f" (issue #{result.issue})"
+    if result.attempts > 1:
+        line += f" [{result.attempts} attempts, ${result.cost_usd:.2f} total]"
     return line
 
 
@@ -28,6 +30,7 @@ def _json(result: Result) -> str:
             "files_touched": result.files_touched,
             "tests_passed": result.tests_passed,
             "cost_usd": result.cost_usd,
+            "attempts": result.attempts,
         }
     )
 
@@ -66,6 +69,19 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         "--session-timeout-s", type=float, default=1800.0, help="session wall-clock cap"
     )
     build.add_argument(
+        "--max-attempts",
+        type=int,
+        default=1,
+        help="retry with a fresh session (resuming the checkpointed branch) on a recoverable "
+        "outcome; 1 keeps the old single-shot behavior",
+    )
+    build.add_argument(
+        "--max-total-budget-usd",
+        type=float,
+        default=None,
+        help="spend cap across all attempts combined (default: 3x --max-budget-usd)",
+    )
+    build.add_argument(
         "--run-tests",
         action="store_true",
         help="re-run the target repo's tests in the worktree before opening the PR",
@@ -94,6 +110,8 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         max_budget_usd=args.max_budget_usd,
         max_turns=args.max_turns,
         session_timeout_s=args.session_timeout_s,
+        max_attempts=args.max_attempts,
+        max_total_budget_usd=args.max_total_budget_usd,
         transcripts_dir=transcripts_dir,
     )
     result = coder.run(issue_number=args.issue)
