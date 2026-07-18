@@ -507,3 +507,70 @@ def test_default_max_attempts_is_one_unchanged_behavior(tmp_path, clean_git_env,
     assert result.outcome == "needs_review"
     assert result.attempts == 1
     assert len(runner.calls) == 1
+
+
+def test_default_guarded_policy_denies_when_the_ask_channel_says_no(
+    tmp_path, clean_git_env, attended_env
+):
+    from mythings.policy import Decision
+
+    from mycoder.coder import default_guarded_policy
+
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "guarded")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    policy = default_guarded_policy()
+    policy.ask = lambda action: Decision.DENY  # a deterministic stand-in for a human
+    result = _coder(repo.path, gh, ledger_path, runner, policy=policy).run(issue_number=5)
+
+    assert result.outcome == "denied"
+    assert not gh.saw("pr", "create")
+    # The ask channel said no to the PR, but v0.3's checkpoint still ran --
+    # a guarded denial doesn't throw the commit away either.
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+
+
+def test_default_guarded_policy_opens_the_pr_when_the_ask_channel_says_yes(
+    tmp_path, clean_git_env, attended_env
+):
+    from mythings.policy import Decision
+
+    from mycoder.coder import default_guarded_policy
+
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "guarded"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/30",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    policy = default_guarded_policy()
+    policy.ask = lambda action: Decision.ALLOW
+    result = _coder(repo.path, gh, ledger_path, runner, policy=policy).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 30
+
+
+def test_unguarded_default_policy_is_unaffected_by_the_pr_action_kind(
+    tmp_path, clean_git_env, attended_env
+):
+    # The PR-open Action moved from kind="bash" to kind="draft-pr-create" so a
+    # Guard() can actually intercept it -- the plain unguarded default (no
+    # --guarded) must still allow it exactly as before.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "unguarded"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/31",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 31

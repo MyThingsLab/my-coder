@@ -6,12 +6,16 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from myguard.guard import Guard
+from myguard.rules import Rule
 from mythings.github import GitHub, Issue
 from mythings.isolation import Workspace, in_github_actions
 from mythings.ledger import Ledger
 from mythings.policy import ALLOW, Action, Decision, Policy, PolicyResult
 
 from mycoder.session import SessionRunner
+
+PR_ACTION_KIND = "draft-pr-create"
 
 TOOL = "mycoder"
 LEDGER_KIND = "code"
@@ -47,9 +51,30 @@ NOT use any `gh` command — MyCoder pushes the branch and opens the draft PR.
 class _AllowAll:
     # Default gate for the one side effect (a draft PR). The fleet driver injects
     # myguard.Guard in production; a lone invocation opens PRs unguarded, same
-    # convention as every other tool's template default.
+    # convention as every other tool's template default. `--guarded` opts a CLI
+    # invocation into default_guarded_policy() below instead.
     def evaluate(self, action: Action) -> PolicyResult:
         return ALLOW
+
+
+def default_guarded_policy() -> Policy:
+    # PR_ACTION_KIND is its own structured kind, not "bash": myguard's rules
+    # treat "bash" as an open-ended escape hatch that's permissive by design
+    # (see myguard/rules.py), so a Guard() gating a `gh pr create` shelled out
+    # as "bash" would silently no-op. Naming the kind is what lets a Rule (and
+    # the fleet's real ASK channel -- MYTHINGS_ASK_CMD, live since 2026-07-12)
+    # actually intercept it, the same pattern myplanner's default_policy()
+    # uses for its own "tracking-issue-edit" kind.
+    return Guard(
+        rules=[
+            Rule(
+                "draft-pr-needs-a-human",
+                Decision.ASK,
+                "opens a draft PR",
+                kind=PR_ACTION_KIND,
+            )
+        ]
+    )
 
 
 def _run_git(tree: Path, argv: list[str]) -> str:
@@ -383,7 +408,15 @@ class Coder:
             tests_passed: bool | None = True if self.run_tests else None
 
             gate = self.policy.evaluate(
-                Action(kind="bash", payload={"command": f"gh pr create --head {branch}"})
+                Action(
+                    kind=PR_ACTION_KIND,
+                    payload={
+                        "repo": self.repo_slug or self._repo_name(),
+                        "issue": issue.number,
+                        "branch": branch,
+                        "command": f"gh pr create --head {branch}",
+                    },
+                )
             )
             if gate.under(unattended=in_github_actions()) is not Decision.ALLOW:
                 detail = f"policy blocked the PR for #{issue.number}: {gate.reason or gate.rule}"
