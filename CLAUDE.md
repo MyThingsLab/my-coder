@@ -33,7 +33,7 @@ covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
   its own responsibility inside the sandbox, but the PR open/promote steps
   my-coder performs itself are wrapped as `Action(kind="bash", ...)` through
   `Policy.evaluate` (MyGuard) first, same as every other tool. Opens at most
-  **one** PR per issue, as a **draft**, head `my-coder/<repo>-<issue-number>`,
+  **one** PR per issue, as a **draft**, head `mycoder/<repo>-<issue-number>`,
   and never promotes it to ready or merges it — promotion requires the PR
   body's checklist to hold (`Closes #<n>` + at least one checked box) and CI
   green; a human always does the actual merge. A session that leaves no
