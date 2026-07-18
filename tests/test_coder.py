@@ -264,3 +264,29 @@ def test_transcript_is_persisted_and_recorded(tmp_path, clean_git_env, attended_
     entry = next(e for e in Ledger(ledger_path) if e.kind == "code" and e.outcome == "success")
     assert entry.data["transcript"] == str(written[0])
     assert entry.data["final_message"] == "done"
+
+
+def test_prompt_carries_a_style_anchor_from_existing_code(tmp_path, clean_git_env, attended_env):
+    # The session must see the repo's existing code so it matches conventions
+    # even when there is no CLAUDE.md to spell them out.
+    repo = make_git_repo(
+        tmp_path,
+        files={
+            "src/pkg/thing.py": "MARKER_SOURCE = 42\n",
+            "tests/test_thing.py": "def test_marker() -> None:\n    assert True\n",
+        },
+    )
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "extend thing"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/11",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"src/pkg/more.py": "x = 1\n"})
+    _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "match its conventions" in prompt
+    assert "MARKER_SOURCE = 42" in prompt  # existing source content is shown
+    assert "src/pkg/thing.py" in prompt  # and the file tree / exemplar header

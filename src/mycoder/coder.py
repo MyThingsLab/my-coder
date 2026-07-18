@@ -28,8 +28,14 @@ Issue #{number}: {title}
 Target-repo conventions (its own CLAUDE.md / HARNESS.md, authoritative here):
 {conventions}
 
+{style_anchor}
+
 Rules:
 - Make the smallest change that fully closes the issue, with tests.
+- Match the conventions of the existing code shown above: module layout, import
+  style (e.g. `from __future__ import annotations`), type hints on EVERY
+  signature (test functions included), naming, and the existing test style. When
+  in doubt, imitate the nearest existing file rather than inventing a style.
 - Run the repo's own test suite and linter; leave them green.
 - Commit your work with git and a clear message. Do NOT run `git push`, and do \
 NOT use any `gh` command — MyCoder pushes the branch and opens the draft PR.
@@ -126,6 +132,35 @@ class Coder:
                 parts.append(f"--- {name} ---\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join(parts) if parts else "(no CLAUDE.md/HARNESS.md found)"
 
+    def _style_anchor(self, tree: Path, *, max_files: int = 3, max_chars: int = 6000) -> str:
+        # A repo without a CLAUDE.md still has a house style in its existing
+        # code; show the session that code so it matches conventions (type
+        # hints, imports, test shape) the first time instead of guessing — the
+        # single biggest source of review-only polish on generated PRs. Largest
+        # files first: more content is a stronger convention signal.
+        try:
+            listed = [p for p in self._git(tree, ["ls-files"]).splitlines() if p]
+        except RuntimeError:
+            return ""
+        exemplars = sorted(
+            (p for p in listed if p.endswith(".py") and (p.startswith(("src/", "tests/")))),
+            key=lambda p: (tree / p).stat().st_size if (tree / p).is_file() else 0,
+            reverse=True,
+        )[:max_files]
+        blocks = []
+        for rel in exemplars:
+            path = tree / rel
+            if path.is_file():
+                blocks.append(f"--- {rel} ---\n{path.read_text(encoding='utf-8')[:max_chars]}")
+        if not blocks:
+            return "Existing code: (none yet — this is an early/greenfield repo)."
+        tree_view = "\n".join(listed[:300])
+        return (
+            "Existing code in this repo (match its conventions exactly):\n\n"
+            f"Repository files:\n{tree_view}\n\n"
+            "Representative existing files:\n\n" + "\n\n".join(blocks)
+        )
+
     def _prompt(self, issue: Issue, tree: Path) -> str:
         return _PROMPT.format(
             repo=self.repo_slug or self._repo_name(),
@@ -133,6 +168,7 @@ class Coder:
             title=issue.title,
             body=issue.body or "(no description)",
             conventions=self._conventions(tree),
+            style_anchor=self._style_anchor(tree),
         )
 
     def _commit_count(self, tree: Path, base_sha: str) -> int:
