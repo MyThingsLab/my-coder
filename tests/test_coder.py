@@ -160,7 +160,12 @@ def test_build_denied_by_policy_opens_no_pr(tmp_path, clean_git_env, attended_en
     assert any(e.outcome == "denied" for e in Ledger(ledger_path))
 
 
-def test_build_fails_when_generated_code_fails_tests(tmp_path, clean_git_env, attended_env):
+def test_build_checkpoints_commits_when_generated_code_fails_tests(
+    tmp_path, clean_git_env, attended_env
+):
+    # Failing the test suite must not throw the session's work away: push the
+    # branch as a checkpoint (needs_review) so a re-run can recycle it instead
+    # of redoing it from scratch.
     repo = make_git_repo(tmp_path)
     gh = FakeGh({("issue", "list"): _issue(5, "broken")})
     ledger_path = tmp_path / "ledger.jsonl"
@@ -170,9 +175,71 @@ def test_build_fails_when_generated_code_fails_tests(tmp_path, clean_git_env, at
     )
     result = coder.run(issue_number=5)
 
+    assert result.outcome == "needs_review"
+    assert result.tests_passed is False
+    assert not gh.saw("pr", "create")
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+
+
+def test_build_fails_when_checkpoint_push_also_fails(tmp_path, clean_git_env, attended_env):
+    from mycoder.coder import _run_git
+
+    def flaky_git(tree, argv):
+        if argv[:1] == ["push"]:
+            raise RuntimeError("remote rejected the push")
+        return _run_git(tree, argv)
+
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "broken")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    coder = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=["python", "-c", "exit(1)"],
+        git=flaky_git,
+    )
+    result = coder.run(issue_number=5)
+
     assert result.outcome == "failure"
     assert result.tests_passed is False
     assert not gh.saw("pr", "create")
+
+
+def test_build_resumes_from_a_checkpointed_branch(tmp_path, clean_git_env, attended_env):
+    # A second run for the same issue, after the first left a checkpoint
+    # (failed tests, no PR), must build on those commits rather than restart
+    # from origin/main -- the whole point of not discarding them.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "broken")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    first = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    coder = _coder(
+        repo.path, gh, ledger_path, first, run_tests=True, test_command=["python", "-c", "exit(1)"]
+    )
+    first_result = coder.run(issue_number=5)
+    assert first_result.outcome == "needs_review"
+
+    gh2 = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "broken"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/10",
+        }
+    )
+    second = FakeSessionRunner(files={"pkg/b.py": "b = 2\n"})
+    coder2 = _coder(repo.path, gh2, ledger_path, second)
+    second_result = coder2.run(issue_number=5)
+
+    assert second_result.outcome == "success"
+    assert second_result.pr == 10
+    # Both the first run's checkpointed commit and the second run's new one
+    # made it into the PR -- nothing from the first attempt was redone or lost.
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+    assert "b = 2" in repo.read_committed("mycoder/my-raytracer-5", "pkg/b.py")
+    assert "already carries 1 commit" in second.calls[0]
 
 
 def test_build_records_a_secret_alert_when_the_transcript_leaks(

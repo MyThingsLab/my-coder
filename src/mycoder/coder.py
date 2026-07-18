@@ -25,6 +25,7 @@ Issue #{number}: {title}
 
 {body}
 
+{resume_note}\
 Target-repo conventions (its own CLAUDE.md / HARNESS.md, authoritative here):
 {conventions}
 
@@ -161,12 +162,24 @@ class Coder:
             "Representative existing files:\n\n" + "\n\n".join(blocks)
         )
 
-    def _prompt(self, issue: Issue, tree: Path) -> str:
+    def _resume_note(self, prior_commits: int) -> str:
+        if prior_commits == 0:
+            return ""
+        return (
+            f"This branch already carries {prior_commits} commit(s) from a prior attempt at "
+            "this same issue -- an earlier run left them here instead of discarding them "
+            "(e.g. it failed the test suite, or was denied a PR). Inspect what's already "
+            "done with `git log` and `git diff`, keep what's good, and finish the job (fix a "
+            "failing test, complete a partial implementation) rather than starting over.\n\n"
+        )
+
+    def _prompt(self, issue: Issue, tree: Path, *, prior_commits: int = 0) -> str:
         return _PROMPT.format(
             repo=self.repo_slug or self._repo_name(),
             number=issue.number,
             title=issue.title,
             body=issue.body or "(no description)",
+            resume_note=self._resume_note(prior_commits),
             conventions=self._conventions(tree),
             style_anchor=self._style_anchor(tree),
         )
@@ -178,6 +191,25 @@ class Coder:
     def _changed_files(self, tree: Path, base_sha: str) -> list[str]:
         out = self._git(tree, ["diff", "--name-only", f"{base_sha}..HEAD"]).strip()
         return [line for line in out.splitlines() if line]
+
+    def _existing_branch_ref(self, branch: str) -> str | None:
+        # A prior run may have checkpointed commits on this issue's branch
+        # without opening a PR (failed tests, a policy denial, a turn-capped
+        # session). Fetching it here is how the next run recycles that work
+        # instead of redoing it from origin/{base}. A non-zero exit means the
+        # branch doesn't exist on origin yet -- an ordinary fresh run.
+        try:
+            self._git(self.repo, ["fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"])
+        except RuntimeError:
+            return None
+        return f"origin/{branch}"
+
+    def _push(self, tree: Path, branch: str) -> str | None:
+        try:
+            self._git(tree, ["push", "-u", "origin", branch])
+        except RuntimeError as exc:
+            return str(exc)
+        return None
 
     def _tests_pass(self, tree: Path) -> bool:
         proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
@@ -218,15 +250,25 @@ class Coder:
             self._record("skipped", detail, issue=issue_number)
             return Result("skipped", detail, issue=issue_number)
 
-        with self._workspace(self.repo, base_ref=f"origin/{self.base}") as tree:
-            branch = f"{TOOL}/{self._repo_name()}-{issue.number}"
+        branch = f"{TOOL}/{self._repo_name()}-{issue.number}"
+        # Recycle a prior run's checkpointed commits instead of starting over:
+        # if this issue's branch already exists on origin (a previous attempt
+        # failed tests, was denied, or hit its turn cap), resume from its tip.
+        base_ref = self._existing_branch_ref(branch) or f"origin/{self.base}"
+        resuming = base_ref != f"origin/{self.base}"
+
+        with self._workspace(self.repo, base_ref=base_ref) as tree:
             # Name the detached worktree HEAD before the session runs so every
             # commit it makes lands on this branch (local-only, no side effect).
             self._git(tree, ["checkout", "-B", branch])
-            base_sha = self._git(tree, ["rev-parse", "HEAD"]).strip()
+            # merge-base with origin/{base}, not rev-parse HEAD: when resuming,
+            # HEAD already carries the prior run's commits, and those must
+            # still count as durable work even if this session adds nothing.
+            base_sha = self._git(tree, ["merge-base", "HEAD", f"origin/{self.base}"]).strip()
+            prior_commits = self._commit_count(tree, base_sha) if resuming else 0
 
             session = self.session_runner.run(
-                prompt=self._prompt(issue, tree),
+                prompt=self._prompt(issue, tree, prior_commits=prior_commits),
                 cwd=tree,
                 max_budget_usd=self.max_budget_usd,
                 max_turns=self.max_turns,
@@ -269,10 +311,37 @@ class Coder:
             files = self._changed_files(tree, base_sha)
 
             if self.run_tests and not self._tests_pass(tree):
-                detail = f"generated code for #{issue.number} failed the test suite"
-                self._record("failure", detail, files_touched=files, tests_passed=False, **common)
+                base_detail = f"generated code for #{issue.number} failed the test suite"
+                push_error = self._push(tree, branch)
+                if push_error is not None:
+                    # Nothing durable reached origin either -- this really is a
+                    # loss, not a checkpoint.
+                    detail = f"{base_detail}; checkpoint push also failed: {push_error}"
+                    self._record(
+                        "failure", detail, files_touched=files, tests_passed=False, **common
+                    )
+                    return Result(
+                        "failure",
+                        detail,
+                        issue=issue.number,
+                        files_touched=files,
+                        tests_passed=False,
+                        cost_usd=session.cost_usd,
+                    )
+                detail = (
+                    f"{base_detail}; branch {branch} pushed as a checkpoint -- "
+                    "re-run to resume and fix"
+                )
+                self._record(
+                    "needs_review",
+                    detail,
+                    files_touched=files,
+                    tests_passed=False,
+                    branch=branch,
+                    **common,
+                )
                 return Result(
-                    "failure",
+                    "needs_review",
                     detail,
                     issue=issue.number,
                     files_touched=files,
@@ -286,7 +355,13 @@ class Coder:
             )
             if gate.under(unattended=in_github_actions()) is not Decision.ALLOW:
                 detail = f"policy blocked the PR for #{issue.number}: {gate.reason or gate.rule}"
-                self._record("denied", detail, files_touched=files, **common)
+                data: dict[str, object] = {"files_touched": files, **common}
+                # Checkpoint even a policy denial, best-effort: the commits are
+                # otherwise thrown away with the worktree on the way out.
+                if self._push(tree, branch) is None:
+                    data["branch"] = branch
+                    detail = f"{detail} (commits checkpointed on {branch})"
+                self._record("denied", detail, **data)
                 return Result(
                     "denied",
                     detail,
@@ -297,10 +372,9 @@ class Coder:
 
             # Push the durable commits regardless of how the session ended, so a
             # turn-capped or timed-out session's real work is never discarded.
-            try:
-                self._git(tree, ["push", "-u", "origin", branch])
-            except RuntimeError as exc:
-                detail = f"commits present but push failed for #{issue.number}: {exc}"
+            push_error = self._push(tree, branch)
+            if push_error is not None:
+                detail = f"commits present but push failed for #{issue.number}: {push_error}"
                 self._record("needs_review", detail, files_touched=files, **common)
                 return Result(
                     "needs_review",
