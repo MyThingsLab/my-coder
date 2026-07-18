@@ -26,12 +26,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      # my-things-core and my-guard are sibling repos, not on PyPI — pull them
-      # from the same owner.
+      # my-things-core, my-guard, my-searcher are sibling repos, not on PyPI —
+      # pull them from the same owner.
       - name: Install my-things-core
         run: pip install "my-things-core @ git+https://github.com/${{ github.repository_owner }}/my-things-core@main"
       - name: Install my-guard
         run: pip install "my-guard @ git+https://github.com/${{ github.repository_owner }}/my-guard@main"
+      - name: Install my-searcher
+        run: pip install "my-searcher @ git+https://github.com/${{ github.repository_owner }}/my-searcher@main"
       - name: Install
         run: pip install -e ".[dev]"
       - name: Ruff
