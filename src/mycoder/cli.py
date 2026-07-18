@@ -56,7 +56,12 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         help="claude runs a real headless session; noop is a dry run (no change, no PR)",
     )
     build.add_argument("--max-budget-usd", type=float, default=5.0, help="session spend cap")
-    build.add_argument("--max-turns", type=int, default=40, help="session turn cap")
+    build.add_argument(
+        "--max-turns",
+        type=int,
+        default=60,
+        help="session turn cap (too low reads as a failure — a small issue already needs ~30)",
+    )
     build.add_argument(
         "--session-timeout-s", type=float, default=1800.0, help="session wall-clock cap"
     )
@@ -66,9 +71,18 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         help="re-run the target repo's tests in the worktree before opening the PR",
     )
     build.add_argument("--ledger", type=Path, default=Path(".mythings/ledger.jsonl"))
+    build.add_argument(
+        "--transcripts-dir",
+        type=Path,
+        default=None,
+        help="where to write the redacted session transcript (default: alongside the ledger)",
+    )
     build.add_argument("--json", action="store_true", help="print the result as JSON")
 
     args = parser.parse_args(argv)
+    # Keep transcripts next to the ledger (its own provenance dir), not in the
+    # invoking CWD — which is often the target repo's checkout.
+    transcripts_dir = args.transcripts_dir or args.ledger.parent / "mycoder-transcripts"
     coder = coder_factory(
         repo=args.source,
         repo_slug=args.repo,
@@ -80,6 +94,7 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         max_budget_usd=args.max_budget_usd,
         max_turns=args.max_turns,
         session_timeout_s=args.session_timeout_s,
+        transcripts_dir=transcripts_dir,
     )
     result = coder.run(issue_number=args.issue)
     print(_json(result) if args.json else _render(result))

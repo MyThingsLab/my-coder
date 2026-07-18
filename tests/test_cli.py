@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from mycoder.cli import main
 from mycoder.coder import Result
@@ -35,6 +36,9 @@ def test_build_wires_args_and_returns_zero(capsys):
     assert coder.ran_issue == 5
     assert coder.kwargs["repo_slug"] == "o/r"
     assert isinstance(coder.kwargs["session_runner"], NoopSessionRunner)
+    assert coder.kwargs["max_turns"] == 60  # generous default, a small issue needs ~30
+    # transcripts co-locate with the ledger, not the invoking CWD.
+    assert coder.kwargs["transcripts_dir"] == Path(".mythings/mycoder-transcripts")
 
 
 def test_build_claude_runner_and_caps(capsys):

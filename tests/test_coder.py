@@ -27,12 +27,14 @@ class FakeSessionRunner:
         commit: bool = True,
         leaked: list[str] | None = None,
         error: str | None = None,
+        transcript: str = "",
     ) -> None:
         self.files = files or {}
         self.ok = ok
         self.commit = commit
         self.leaked = leaked or []
         self.error = error
+        self.transcript = transcript
         self.calls: list[str] = []
 
     def run(
@@ -45,8 +47,8 @@ class FakeSessionRunner:
         timeout_s: float,
     ) -> SessionResult:
         self.calls.append(prompt)
-        if not self.ok:
-            return SessionResult(ok=False, error=self.error or "claude exited 1")
+        # Write + commit first (a real session that hits its turn cap has still
+        # done durable work), then report ok/not-ok independently.
         for rel, content in self.files.items():
             target = Path(cwd) / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -58,8 +60,20 @@ class FakeSessionRunner:
                 check=True,
                 capture_output=True,
             )
+        if not self.ok:
+            return SessionResult(
+                ok=False,
+                error=self.error or "claude exited 1",
+                leaked=self.leaked,
+                transcript=self.transcript,
+            )
         return SessionResult(
-            ok=True, turns=3, cost_usd=0.01, final_message="done", leaked=self.leaked
+            ok=True,
+            turns=3,
+            cost_usd=0.01,
+            final_message="done",
+            leaked=self.leaked,
+            transcript=self.transcript,
         )
 
 
@@ -209,3 +223,44 @@ def test_build_needs_review_when_push_fails(tmp_path, clean_git_env, attended_en
     assert result.outcome == "needs_review"
     assert not gh.saw("pr", "create")
     assert any(e.outcome == "needs_review" for e in Ledger(ledger_path))
+
+
+def test_errored_session_with_commits_pushes_but_opens_no_pr(tmp_path, clean_git_env, attended_env):
+    # A session that committed real work then hit its turn cap (is_error) must
+    # not throw that work away: push the branch, open NO PR, report needs_review.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "partial")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"}, ok=False, error="hit max turns")
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert not gh.saw("pr", "create")
+    # The durable work reached the origin even though the session errored.
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+
+
+def test_transcript_is_persisted_and_recorded(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "traced"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/9",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    transcripts = tmp_path / "transcripts"
+    runner = FakeSessionRunner(
+        files={"pkg/a.py": "a = 1\n"}, transcript='{"type":"result","result":"ok"}'
+    )
+    result = _coder(repo.path, gh, ledger_path, runner, transcripts_dir=transcripts).run(
+        issue_number=5
+    )
+
+    assert result.outcome == "success"
+    written = list(transcripts.glob("*.jsonl"))
+    assert len(written) == 1
+    assert "result" in written[0].read_text()
+    entry = next(e for e in Ledger(ledger_path) if e.kind == "code" and e.outcome == "success")
+    assert entry.data["transcript"] == str(written[0])
+    assert entry.data["final_message"] == "done"
