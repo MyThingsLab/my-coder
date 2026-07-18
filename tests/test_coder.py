@@ -574,3 +574,85 @@ def test_unguarded_default_policy_is_unaffected_by_the_pr_action_kind(
 
     assert result.outcome == "success"
     assert result.pr == 31
+
+
+def test_prompt_carries_my_searcher_relevant_files(tmp_path, clean_git_env, attended_env):
+    # my-searcher's own CLAUDE.md documents this exact hand-off: a "which
+    # files matter here" step for later tools including MyCoder.
+    repo = make_git_repo(
+        tmp_path,
+        files={
+            "src/pkg/camera.py": "class Camera:\n    pass\n",
+            "src/pkg/unrelated.py": "x = 1\n",
+        },
+    )
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "fix the camera projection", "camera math is wrong"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/40",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"src/pkg/camera.py": "class Camera:\n    fixed = True\n"})
+    _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "my-searcher ranked" in prompt
+    assert "src/pkg/camera.py" in prompt
+    # my-searcher's own ranking run is on the ledger too, separate from
+    # mycoder's own kind=code entries.
+    assert any(e.tool == "mysearcher" and e.kind == "search" for e in Ledger(ledger_path))
+
+
+def test_prompt_carries_prior_research_from_the_shared_ledger(
+    tmp_path, clean_git_env, attended_env
+):
+    # Read-only fence: a prior `myresearcher brief` run against this same
+    # repo left a ledger entry; mycoder surfaces it without importing
+    # myresearcher's package, same convention as MyTodo reading MyPlanner.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "implement path tracing integrator"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/41",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    Ledger(ledger_path).record(
+        "myresearcher",
+        "research",
+        "success",
+        "brief for path tracing",
+        topic="Monte Carlo path tracing integrators",
+        summary="Cosine-weighted hemisphere sampling cancels the PDF term.",
+    )
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "Prior research on" in prompt
+    assert "Cosine-weighted hemisphere sampling cancels the PDF term." in prompt
+
+
+def test_prompt_has_no_research_section_when_nothing_matches(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "implement path tracing integrator"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/42",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    Ledger(ledger_path).record(
+        "myresearcher",
+        "research",
+        "success",
+        "brief for an unrelated topic",
+        topic="Distributed systems consensus algorithms",
+        summary="Irrelevant to this issue.",
+    )
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "Prior research on" not in prompt

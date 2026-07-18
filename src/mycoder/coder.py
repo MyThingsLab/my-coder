@@ -8,6 +8,8 @@ from pathlib import Path
 
 from myguard.guard import Guard
 from myguard.rules import Rule
+from mysearcher.searcher import Issue as SearchIssue
+from mysearcher.searcher import Searcher
 from mythings.github import GitHub, Issue
 from mythings.isolation import Workspace, in_github_actions
 from mythings.ledger import Ledger
@@ -30,6 +32,8 @@ Issue #{number}: {title}
 {body}
 
 {resume_note}\
+{relevant_files}\
+{research_context}\
 Target-repo conventions (its own CLAUDE.md / HARNESS.md, authoritative here):
 {conventions}
 
@@ -210,6 +214,48 @@ class Coder:
             "failing test, complete a partial implementation) rather than starting over.\n\n"
         )
 
+    def _relevant_files(self, tree: Path, issue: Issue) -> str:
+        # my-searcher's own CLAUDE.md documents this exact hand-off: "a
+        # reusable 'which files matter here' step for later tools (MyGroomer,
+        # MyCoder)". NoopEngine (the class default) keeps this free and
+        # deterministic -- token-overlap pre-ranking only, no extra Engine
+        # spend. comment=False: my-coder posts no issue comments of its own.
+        result = Searcher(repo_path=tree, ledger=self.ledger, repo=self.repo_slug).rank(
+            SearchIssue(number=issue.number, title=issue.title, body=issue.body or ""),
+        )
+        if not result.ranked:
+            return ""
+        listed = "\n".join(f"- `{p}`" for p in result.ranked[:15])
+        return (
+            "Files my-searcher ranked most relevant to this issue (start "
+            "here, but you are not limited to these):\n" + listed + "\n\n"
+        )
+
+    def _research_context(self, issue: Issue) -> str:
+        # Read-only fence, not a package import: my-researcher isn't designed
+        # as a library call like my-searcher is, so this only reads its
+        # already-published `kind=research` ledger entries (same convention
+        # as MyTodo reading MyPlanner's ledger). Only ever finds anything when
+        # a prior `myresearcher brief` ran against *this* repo's issues, since
+        # that's the ledger this Coder was given.
+        title_words = {w for w in issue.title.lower().split() if len(w) > 3}
+        if not title_words:
+            return ""
+        blocks = []
+        for entry in self.ledger.read(tool="myresearcher", kind="research"):
+            if entry.outcome != "success":
+                continue
+            topic = str(entry.data.get("topic", ""))
+            topic_words = {w for w in topic.lower().split() if len(w) > 3}
+            if not (title_words & topic_words):
+                continue
+            summary = str(entry.data.get("summary", ""))[:1000]
+            if summary:
+                blocks.append(f"Prior research on {topic!r}:\n{summary}")
+            if len(blocks) == 2:
+                break
+        return "\n\n".join(blocks) + "\n\n" if blocks else ""
+
     def _prompt(self, issue: Issue, tree: Path, *, prior_commits: int = 0) -> str:
         return _PROMPT.format(
             repo=self.repo_slug or self._repo_name(),
@@ -217,6 +263,8 @@ class Coder:
             title=issue.title,
             body=issue.body or "(no description)",
             resume_note=self._resume_note(prior_commits),
+            relevant_files=self._relevant_files(tree, issue),
+            research_context=self._research_context(issue),
             conventions=self._conventions(tree),
             style_anchor=self._style_anchor(tree),
         )
