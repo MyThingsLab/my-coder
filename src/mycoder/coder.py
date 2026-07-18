@@ -36,9 +36,17 @@ Rules:
   style (e.g. `from __future__ import annotations`), type hints on EVERY
   signature (test functions included), naming, and the existing test style. When
   in doubt, imitate the nearest existing file rather than inventing a style.
-- Run the repo's own test suite and linter; leave them green.
-- Commit your work with git and a clear message. Do NOT run `git push`, and do \
-NOT use any `gh` command — MyCoder pushes the branch and opens the draft PR.
+- Run the repo's test suite and linter and leave them green. You CANNOT install
+  packages or reach the network: if pytest can't import the package (a `src/`
+  layout with no editable install), run `PYTHONPATH=src python -m pytest` or add
+  `pythonpath = ["src"]` under `[tool.pytest.ini_options]` — never run `pip \
+install`.
+- ALWAYS commit your finished work with git, even if you could not run the full
+  suite locally (CI runs the tests on the PR). NEVER end the session with
+  completed changes left uncommitted, and never stop to ask for approval — if a
+  command is blocked, find another way or commit what you already have.
+- Do NOT run `git push` and do NOT use any `gh` command — MyCoder pushes the \
+branch and opens the draft PR itself.
 - Stay entirely within this repo's checkout; never touch another repo.
 """
 
