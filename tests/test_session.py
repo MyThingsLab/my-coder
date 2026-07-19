@@ -9,6 +9,7 @@ from mycoder.session import (
     ClaudeSessionRunner,
     NoopSessionRunner,
     _parse_result,
+    child_env,
     redact_secrets,
 )
 
@@ -67,6 +68,45 @@ def test_claude_runner_parses_a_successful_session() -> None:
     assert "--allowedTools" in argv and "--disallowedTools" in argv
     assert all(tool in argv for tool in ALLOWED_TOOLS)
     assert all(deny in argv for deny in DENY_READS)
+    # Only the target repo's settings load, so an operator's user-level hook
+    # can't rewrite an allowlisted command (e.g. pytest) out from the session.
+    assert argv[argv.index("--setting-sources") + 1] == "project,local"
+
+
+def test_claude_runner_sanitizes_the_child_env() -> None:
+    seen: dict[str, str] = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, stdout=_RESULT_LINE, stderr="")
+
+    ClaudeSessionRunner(runner=fake_run).run(
+        prompt="do it", cwd=Path("/tmp"), max_budget_usd=5.0, max_turns=40, timeout_s=1800.0
+    )
+    # The nested-session markers never reach the child; identity survives.
+    assert "CLAUDECODE" not in seen
+    assert not any(k.startswith("CLAUDE_CODE_") for k in seen)
+
+
+def test_child_env_drops_session_markers_but_keeps_config_dir() -> None:
+    base = {
+        "CLAUDE_CONFIG_DIR": "/home/bot/.claude-x",
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "AI_AGENT": "1",
+        "PATH": "/usr/bin",
+    }
+    env = child_env(base)
+    assert env["CLAUDE_CONFIG_DIR"] == "/home/bot/.claude-x"
+    assert env["PATH"] == "/usr/bin"
+    assert "CLAUDECODE" not in env
+    assert "CLAUDE_CODE_ENTRYPOINT" not in env
+    assert "AI_AGENT" not in env
+
+
+def test_child_env_passthrough_when_no_markers() -> None:
+    base = {"PATH": "/usr/bin", "HOME": "/home/bot"}
+    assert child_env(base) == base
 
 
 def test_claude_runner_reports_a_nonzero_exit_as_not_ok() -> None:
