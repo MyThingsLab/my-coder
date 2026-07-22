@@ -14,14 +14,17 @@ from mythings import _secrets
 # worker invocation (my-fleet `fleet_dispatch.DEFAULT_ALLOWED_TOOLS`): Read/Edit/
 # Write plus git, the test runner, the linter, and non-mutating shell
 # inspection. `rm`/`pip`/`find` stay off (they mutate or run code); `gh` stays
-# off deliberately — a v0 my-coder session edits and *commits* only, and
-# my-coder itself owns the single push + draft-PR side effect so that one step
-# is the only thing Policy/Guard has to gate.
+# off except the two narrow escapes the blocker/critical-bug protocol needs
+# (filing an issue in ANOTHER repo) — a v0 my-coder session otherwise edits and
+# *commits* only, and my-coder itself owns the single push + draft-PR side
+# effect for the target repo so that one step is the only thing Policy/Guard
+# has to gate.
 ALLOWED_TOOLS = [
     "Read",
     "Edit",
     "Write",
     "Bash(git *)",
+    "Bash(gh issue create*)",
     "Bash(pytest*)",
     "Bash(python -m pytest*)",
     "Bash(python3 -m pytest*)",
