@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -13,14 +14,17 @@ from mythings import _secrets
 # worker invocation (my-fleet `fleet_dispatch.DEFAULT_ALLOWED_TOOLS`): Read/Edit/
 # Write plus git, the test runner, the linter, and non-mutating shell
 # inspection. `rm`/`pip`/`find` stay off (they mutate or run code); `gh` stays
-# off deliberately — a v0 my-coder session edits and *commits* only, and
-# my-coder itself owns the single push + draft-PR side effect so that one step
-# is the only thing Policy/Guard has to gate.
+# off except the two narrow escapes the blocker/critical-bug protocol needs
+# (filing an issue in ANOTHER repo) — a v0 my-coder session otherwise edits and
+# *commits* only, and my-coder itself owns the single push + draft-PR side
+# effect for the target repo so that one step is the only thing Policy/Guard
+# has to gate.
 ALLOWED_TOOLS = [
     "Read",
     "Edit",
     "Write",
     "Bash(git *)",
+    "Bash(gh issue create*)",
     "Bash(pytest*)",
     "Bash(python -m pytest*)",
     "Bash(python3 -m pytest*)",
@@ -55,6 +59,25 @@ DENY_READS = [
     "Edit(**/.venv/**)",
     "Edit(**/dev-ledger/**)",
 ]
+
+# Non-config Claude-Code session markers. A worker session is itself a
+# `claude` subprocess; if it inherits these from a parent Claude Code session
+# it believes it is nested and routes every tool call through a permission
+# prompt that has no answerer, silently blocking all Bash — the session can
+# still edit files but can never run its tests or `git commit`, so it always
+# reports `no_changes`. Stripped from the child env; `CLAUDE_CONFIG_DIR` is
+# kept because it selects the account/identity the session runs under.
+_DROP_ENV = frozenset({"CLAUDECODE", "AI_AGENT"})
+
+
+def child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    for key in list(env):
+        if key == "CLAUDE_CONFIG_DIR":
+            continue
+        if key.startswith("CLAUDE_CODE_") or key in _DROP_ENV:
+            del env[key]
+    return env
 
 
 def redact_secrets(text: str) -> tuple[str, list[str]]:
@@ -147,6 +170,15 @@ class ClaudeSessionRunner:
             str(max_budget_usd),
             "--max-turns",
             str(max_turns),
+            # Load only the target repo's own settings, never the operator's
+            # user-level ones. A personal user hook (e.g. an `rtk` PreToolUse
+            # command-rewriter that turns `pytest` into `rtk pytest`) rewrites
+            # the command out from under `--allowedTools`, so the rewritten
+            # form fails the allowlist and the session can never run its tests.
+            # A worker session must be deterministic and depend only on the
+            # repo it is editing.
+            "--setting-sources",
+            "project,local",
             "--disallowedTools",
             *DENY_READS,
             "--allowedTools",
@@ -154,7 +186,12 @@ class ClaudeSessionRunner:
         ]
         try:
             proc = self._runner(
-                argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s
+                argv,
+                cwd=str(cwd),
+                env=child_env(),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
             raw = exc.stdout or ""
