@@ -15,6 +15,8 @@ def _render(result: Result) -> str:
     line = f"{result.outcome}: {result.detail}"
     if result.issue is not None:
         line += f" (issue #{result.issue})"
+    if result.blocker is not None:
+        line += f" [blocked on {result.blocker}]"
     if result.attempts > 1:
         line += f" [{result.attempts} attempts, ${result.cost_usd:.2f} total]"
     return line
@@ -31,6 +33,7 @@ def _json(result: Result) -> str:
             "tests_passed": result.tests_passed,
             "cost_usd": result.cost_usd,
             "attempts": result.attempts,
+            "blocker": result.blocker,
         }
     )
 

@@ -28,6 +28,7 @@ class FakeSessionRunner:
         leaked: list[str] | None = None,
         error: str | None = None,
         transcript: str = "",
+        final_message: str = "done",
     ) -> None:
         self.files = files or {}
         self.ok = ok
@@ -35,6 +36,7 @@ class FakeSessionRunner:
         self.leaked = leaked or []
         self.error = error
         self.transcript = transcript
+        self.final_message = final_message
         self.calls: list[str] = []
 
     def run(
@@ -71,7 +73,7 @@ class FakeSessionRunner:
             ok=True,
             turns=3,
             cost_usd=0.01,
-            final_message="done",
+            final_message=self.final_message,
             leaked=self.leaked,
             transcript=self.transcript,
         )
@@ -188,6 +190,46 @@ def test_build_skips_when_issue_is_absent(tmp_path, clean_git_env, attended_env)
     assert result.outcome == "skipped"
     assert runner.calls == []  # the session is never launched
     assert not gh.saw("pr", "create")
+
+
+def test_build_blocked_when_session_reports_a_cross_repo_blocker(
+    tmp_path, clean_git_env, attended_env
+):
+    # The model chose to pause on a missing capability elsewhere rather than
+    # thrash -- committed nothing itself, just filed an issue and printed the
+    # sentinel. Must read as "blocked", never "no_changes" or "failure".
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "needs a core fix first")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(
+        commit=False,
+        final_message="FLEET-DISPATCH-BLOCKED: MyThingsLab/my-things-core#42",
+    )
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "blocked"
+    assert result.blocker == "MyThingsLab/my-things-core#42"
+    assert not gh.saw("pr", "create")
+    entry = next(e for e in Ledger(ledger_path) if e.outcome == "blocked")
+    assert entry.data["blocker"] == "MyThingsLab/my-things-core#42"
+
+
+def test_build_blocked_checkpoints_partial_commits(tmp_path, clean_git_env, attended_env):
+    # A blocker discovered partway through still leaves durable work behind --
+    # checkpoint it (same convention as a policy denial), don't discard it.
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh({("issue", "list"): _issue(5, "partially blocked")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(
+        files={"pkg/a.py": "a = 1\n"},
+        final_message="FLEET-DISPATCH-BLOCKED: MyThingsLab/my-guard#7",
+    )
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "blocked"
+    assert result.blocker == "MyThingsLab/my-guard#7"
+    assert "pkg/a.py" in result.files_touched
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
 
 
 def test_build_denied_by_policy_opens_no_pr(tmp_path, clean_git_env, attended_env):

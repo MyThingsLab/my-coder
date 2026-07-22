@@ -27,7 +27,9 @@ mycoder build --repo MyThingsLab/my-raytracer --issue 12 \
 The session is sandboxed to a throwaway git worktree and may only edit files
 and commit; my-coder itself performs the single push + `gh pr create --draft`
 side effect, gated by `Policy`. It never merges. Outcomes: `success` (commit +
-draft PR), `no_changes`, `needs_review`, `denied`, `skipped`, `failure`.
+draft PR), `no_changes`, `needs_review`, `denied`, `skipped`, `failure`,
+`blocked` (paused on a missing capability in another repo the session filed
+an issue for — see the `FLEET-DISPATCH-BLOCKED:` sentinel in the prompt).
 
 ## Install (development)
 
