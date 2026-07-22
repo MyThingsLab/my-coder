@@ -23,6 +23,8 @@ TOOL = "mycoder"
 LEDGER_KIND = "code"
 BACKLOG_LABEL = "my-coder"  # my-coder's own bugs; target issues arrive via --issue
 
+_BLOCKED_SENTINEL = "FLEET-DISPATCH-BLOCKED:"
+
 _PROMPT = """\
 You are MyCoder, the MyThingsLab fleet's worker. Close this one GitHub issue in \
 {repo} by editing files in the current checkout.
@@ -39,6 +41,30 @@ Target-repo conventions (its own CLAUDE.md / HARNESS.md, authoritative here):
 
 {style_anchor}
 
+You are running fully non-interactively, as a headless session: no human is \
+watching and no one can approve a permission prompt. If a command is denied, \
+do NOT ask for approval or wait for it — it will never come. Work only with \
+the tools you already have.
+
+If this issue turns out to be blocked by a missing capability in ANOTHER \
+MyThingsLab repo (a contract, helper, or fix that repo must land first), do \
+not thrash against it. Use `gh issue create --repo MyThingsLab/<repo>` to file \
+a precise issue describing exactly what that repo must add and why, then END \
+your run by printing one final line, exactly:
+  {blocked_sentinel} MyThingsLab/<repo>#<number>
+naming the issue you just filed. That records the dependency so this issue is \
+paused, not failed, until the blocker is resolved.
+
+If while working you discover a SEPARATE bug that is a security issue or \
+breaks a core invariant shared across the fleet (a `my-things-core` contract, \
+the build harness, or anything that would let other tools ship broken work on \
+top of it), file it immediately with `gh issue create --label critical --label \
+bug --repo MyThingsLab/<repo>` describing exactly what's broken and its blast \
+radius. That label halts new fleet dispatch org-wide until it's closed — do \
+not wait until you finish this task to file it. Filing it does not abort your \
+own work; keep going on this issue unless the critical bug blocks it directly, \
+in which case treat it as a blocker per the paragraph above.
+
 Rules:
 - Make the smallest change that fully closes the issue, with tests.
 - Match the conventions of the existing code shown above: module layout, import
@@ -47,7 +73,8 @@ Rules:
   in doubt, imitate the nearest existing file rather than inventing a style.
 - Run the repo's own test suite and linter; leave them green.
 - Commit your work with git and a clear message. Do NOT run `git push`, and do \
-NOT use any `gh` command — MyCoder pushes the branch and opens the draft PR.
+NOT use any `gh` command other than `gh issue create` for a blocker/critical bug \
+above — MyCoder pushes the branch and opens the draft PR.
 - Stay entirely within this repo's checkout; never touch another repo.
 """
 
@@ -92,7 +119,7 @@ def _run_git(tree: Path, argv: list[str]) -> str:
 
 @dataclass(frozen=True)
 class Result:
-    outcome: str  # success | needs_review | no_changes | skipped | denied | failure
+    outcome: str  # success | needs_review | no_changes | skipped | denied | failure | blocked
     detail: str
     issue: int | None = None
     pr: int | None = None
@@ -100,6 +127,16 @@ class Result:
     tests_passed: bool | None = None
     cost_usd: float = 0.0  # summed across every attempt, not just the last
     attempts: int = 1
+    blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
+
+
+def _parse_blocker(final_message: str) -> str | None:
+    for line in final_message.splitlines():
+        line = line.strip()
+        if line.startswith(_BLOCKED_SENTINEL):
+            ref = line[len(_BLOCKED_SENTINEL) :].strip()
+            return ref or None
+    return None
 
 
 class Coder:
@@ -267,6 +304,7 @@ class Coder:
             research_context=self._research_context(issue),
             conventions=self._conventions(tree),
             style_anchor=self._style_anchor(tree),
+            blocked_sentinel=_BLOCKED_SENTINEL,
         )
 
     def _commit_count(self, tree: Path, base_sha: str) -> int:
@@ -330,9 +368,12 @@ class Coder:
 
     # Outcomes worth a fresh attempt: a checkpointed branch (needs_review) or
     # a session that left nothing durable (failure) both still have budget
-    # left to try again. denied/no_changes/success/skipped are all a
+    # left to try again. denied/no_changes/success/skipped/blocked are all a
     # considered stopping point, not a transient miss -- retrying them either
     # re-hits the same policy wall or burns money re-confirming a no-op.
+    # blocked in particular waits on an external event (the blocker issue
+    # closing), which this in-process attempt loop can't observe -- that's the
+    # caller's job (e.g. the fleet dispatcher re-invoking once it's closed).
     _RETRYABLE = frozenset({"needs_review", "failure"})
 
     def run(self, issue_number: int) -> Result:
@@ -402,6 +443,30 @@ class Coder:
             }
 
             commits = self._commit_count(tree, base_sha)
+
+            # An explicit blocker signal wins over everything else: the model
+            # chose to pause on a cross-repo dependency rather than thrash,
+            # which is a distinct outcome from failing or a plain no-op --
+            # checked before the commit-count branches below so a blocked run
+            # with zero commits (it only filed an issue elsewhere) isn't
+            # mistaken for no_changes/failure.
+            blocker = _parse_blocker(session.final_message)
+            if blocker is not None:
+                detail = f"paused on cross-repo blocker {blocker}"
+                files = self._changed_files(tree, base_sha) if commits > 0 else []
+                data: dict[str, object] = {"blocker": blocker, "files_touched": files, **common}
+                if commits > 0 and self._push(tree, branch) is None:
+                    data["branch"] = branch
+                self._record("blocked", detail, **data)
+                return Result(
+                    "blocked",
+                    detail,
+                    issue=issue.number,
+                    files_touched=files,
+                    cost_usd=session.cost_usd,
+                    blocker=blocker,
+                )
+
             if commits == 0:
                 # Nothing durable to keep: an errored session that committed
                 # nothing is a real failure; a clean one is an honest no-op.

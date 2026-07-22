@@ -73,6 +73,13 @@ def test_claude_runner_parses_a_successful_session() -> None:
     assert argv[argv.index("--setting-sources") + 1] == "project,local"
 
 
+def test_allowed_tools_permits_filing_a_blocker_issue_via_gh() -> None:
+    # The only `gh` escape: the blocker/critical-bug protocol tells the model
+    # to `gh issue create` in ANOTHER repo -- without this, that instruction
+    # would be silently denied and the sentinel line would never get filed.
+    assert "Bash(gh issue create*)" in ALLOWED_TOOLS
+
+
 def test_claude_runner_sanitizes_the_child_env() -> None:
     seen: dict[str, str] = {}
 
