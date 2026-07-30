@@ -833,3 +833,60 @@ def test_target_conventions_supersede_the_fleet_style_mandate(
     assert "Comment why, never what." in prompt
     assert "from __future__ import annotations" not in prompt
     assert "they win over any habit of" in prompt
+
+
+def test_timed_out_session_salvages_its_uncommitted_edits(tmp_path, clean_git_env, attended_env):
+    # my-coder#19: a session killed by the wall clock has usually made its edits
+    # and not reached `git commit`, because it commits last. Those edits used to
+    # die with the worktree.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "fix the model")})
+    runner = FakeSessionRunner(
+        files={"model.py": "MARKER = 2\n"},
+        commit=False,
+        ok=False,
+        error="session exceeded 1500s wall-clock timeout",
+    )
+    result = _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert "salvaged" in result.detail
+    assert "model.py" in result.files_touched
+    # Banked on origin, so the next attempt resumes instead of restarting.
+    assert "MARKER = 2" in repo.read_committed("mycoder/my-raytracer-5", "model.py")
+    # Never a PR: nothing here passed the session's own review or a test run.
+    assert not any(c[:2] == ["pr", "create"] for c in gh.calls)
+
+
+def test_salvage_never_commits_an_environment_directory(tmp_path, clean_git_env, attended_env):
+    # The salvage commit gets pushed, and a session may well have built a
+    # multi-GB venv in the worktree.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "fix the model")})
+    runner = FakeSessionRunner(
+        files={
+            "model.py": "MARKER = 2\n",
+            ".venv/bin/python": "#!/bin/sh\n",
+            "__pycache__/model.pyc": "junk\n",
+        },
+        commit=False,
+        ok=False,
+        error="session exceeded 1500s wall-clock timeout",
+    )
+    result = _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.files_touched == ["model.py"]
+
+
+def test_a_clean_worktree_after_a_failed_session_is_still_a_failure(
+    tmp_path, clean_git_env, attended_env
+):
+    # Salvage must not turn an honest empty run into a checkpoint.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "fix the model")})
+    runner = FakeSessionRunner(files={}, ok=False, error="claude exited 1")
+    result = _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner).run(issue_number=5)
+
+    assert result.outcome == "failure"
+    assert result.files_touched == []

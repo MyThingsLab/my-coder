@@ -107,6 +107,10 @@ Rules:
 - Run the repo's own test suite and linter; leave them green. If its
   dependencies are missing from this checkout, install them first (the repo's
   own declared dependencies only) and then run the suite.
+- Commit as you go, not once at the end. You are on a wall clock and may be
+  killed mid-run; anything uncommitted at that moment is unverified work
+  someone else has to review. Commit each coherent step as soon as it stands
+  on its own, even before the suite is green.
 - Commit your work with git and a clear message. Do NOT run `git push`{gh_rule}
 - Stay entirely within this repo's checkout; never touch another repo.
 """
@@ -411,6 +415,48 @@ class Coder:
         out = self._git(tree, ["diff", "--name-only", f"{base_sha}..HEAD"]).strip()
         return [line for line in out.splitlines() if line]
 
+    def _is_dirty(self, tree: Path) -> bool:
+        return bool(self._git(tree, ["status", "--porcelain"]).strip())
+
+    def _salvage(self, tree: Path, issue: Issue) -> bool:
+        # A session killed by the wall clock has usually made its edits and not
+        # reached `git commit` -- it commits last, after the suite is green.
+        # Those edits used to die with the worktree (my-coder#19). Bank them as
+        # a checkpoint so the next attempt resumes instead of restarting.
+        # Environment directories are excluded explicitly rather than trusted to
+        # the target's .gitignore: a session may well have built a multi-GB venv
+        # in here, and this commit gets pushed.
+        try:
+            self._git(
+                tree,
+                [
+                    "add",
+                    "-A",
+                    "--",
+                    ".",
+                    ":(exclude).venv",
+                    ":(exclude)venv",
+                    ":(exclude)node_modules",
+                    ":(exclude)__pycache__",
+                ],
+            )
+            staged = self._git(tree, ["diff", "--cached", "--name-only"]).strip()
+            if not staged:
+                return False
+            self._git(
+                tree,
+                [
+                    "commit",
+                    "-m",
+                    f"Checkpoint uncommitted work on #{issue.number}\n\n"
+                    "Salvaged by MyCoder: the session ended before committing. This is "
+                    "unverified work-in-progress, not a session's own considered commit.",
+                ],
+            )
+        except RuntimeError:
+            return False
+        return True
+
     def _existing_branch_ref(self, branch: str) -> str | None:
         # A prior run may have checkpointed commits on this issue's branch
         # without opening a PR (failed tests, a policy denial, a turn-capped
@@ -571,6 +617,11 @@ class Coder:
                     blocker=blocker,
                 )
 
+            salvaged = False
+            if commits == 0 and self._is_dirty(tree):
+                salvaged = self._salvage(tree, issue)
+                commits = self._commit_count(tree, base_sha) if salvaged else commits
+
             if commits == 0:
                 # Nothing durable to keep: an errored session that committed
                 # nothing is a real failure; a clean one is an honest no-op.
@@ -583,6 +634,41 @@ class Coder:
                 return Result(outcome, detail, issue=issue.number, cost_usd=session.cost_usd)
 
             files = self._changed_files(tree, base_sha)
+
+            if salvaged:
+                # Never a PR: nothing here passed the session's own review, let
+                # alone a test run. Push it so the next attempt resumes from it.
+                base_detail = (
+                    f"session ended without committing ({session.error or 'no error reported'}); "
+                    f"uncommitted work salvaged for #{issue.number}"
+                )
+                push_error = self._push(tree, branch)
+                if push_error is not None:
+                    detail = f"{base_detail}; checkpoint push also failed: {push_error}"
+                    self._record("failure", detail, files_touched=files, **common)
+                    return Result(
+                        "failure",
+                        detail,
+                        issue=issue.number,
+                        files_touched=files,
+                        cost_usd=session.cost_usd,
+                    )
+                detail = f"{base_detail} onto {branch} -- re-run to resume and finish"
+                self._record(
+                    "needs_review",
+                    detail,
+                    files_touched=files,
+                    branch=branch,
+                    salvaged=True,
+                    **common,
+                )
+                return Result(
+                    "needs_review",
+                    detail,
+                    issue=issue.number,
+                    files_touched=files,
+                    cost_usd=session.cost_usd,
+                )
 
             tests_ok, test_error = self._tests_pass(tree) if self.run_tests else (True, None)
             if not tests_ok:
