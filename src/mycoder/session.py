@@ -32,6 +32,15 @@ ALLOWED_TOOLS = [
     "Bash(ruff*)",
     "Bash(python -m ruff*)",
     "Bash(python3 -m ruff*)",
+    # The venv-local forms close the install→verify loop. A PEP 668 host (any
+    # recent Debian/Ubuntu) refuses to install into the system interpreter at
+    # all, so the only route to an importable dependency is a venv inside the
+    # worktree -- and without these the session could build that venv and still
+    # not run anything with it.
+    "Bash(.venv/bin/pytest*)",
+    "Bash(.venv/bin/python -m pytest*)",
+    "Bash(.venv/bin/ruff*)",
+    "Bash(.venv/bin/python -m ruff*)",
     "Bash(ls*)",
     "Bash(cat*)",
     "Bash(head*)",
@@ -57,6 +66,7 @@ ALLOWED_TOOLS = [
     "Bash(uv sync*)",
     "Bash(python -m pip install*)",
     "Bash(python3 -m pip install*)",
+    "Bash(.venv/bin/pip install*)",
 ]
 
 # Withheld when the target repo is outside the fleet: `gh issue create` exists

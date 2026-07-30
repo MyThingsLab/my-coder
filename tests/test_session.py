@@ -182,3 +182,12 @@ def test_runner_passes_the_out_of_fleet_allowlist_to_claude(tmp_path) -> None:
     )
     assert "Bash(gh issue create*)" not in seen["argv"]
     assert "Bash(uv pip install*)" in seen["argv"]
+
+
+def test_allowlist_closes_the_install_then_verify_loop() -> None:
+    # my-coder#15: on a PEP 668 host the only importable environment is a venv
+    # inside the worktree, so the session must be able to run *that* one.
+    assert "Bash(uv venv*)" in ALLOWED_TOOLS
+    assert "Bash(.venv/bin/pip install*)" in ALLOWED_TOOLS
+    assert "Bash(.venv/bin/python -m pytest*)" in ALLOWED_TOOLS
+    assert "Bash(.venv/bin/ruff*)" in ALLOWED_TOOLS
