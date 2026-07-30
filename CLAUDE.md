@@ -43,6 +43,23 @@ covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
   (`FLEET-DISPATCH-BLOCKED: MyThingsLab/<repo>#<number>`), which pauses the
   candidate rather than failing it. Never touches a repo other than the one
   named by the issue it was given.
+- **Out-of-fleet targets:** `--repo` may name a repo outside `MyThingsLab`, and
+  the invariant above then has to be enforced, not just stated. A session on an
+  out-of-fleet target loses `gh` entirely (`session.allowed_tools(in_fleet=False)`)
+  and its prompt drops both cross-repo escapes: the blocker protocol and the
+  critical-bug filing both reach into sibling org repos, and the `critical`
+  label halts fleet dispatch org-wide — a repo my-coder was merely pointed at
+  must not be able to stop the fleet. Fleet house style is likewise asserted
+  only when the target states none of its own; a target with a `CLAUDE.md` has
+  already been told its conventions are authoritative.
+- **Blast radius of the session sandbox:** the session may install
+  dependencies — install subcommands only (`pip install`, `uv pip install`,
+  `python3 -m pip install`, `uv sync`), never a bare `pip`/`uv`. A worktree
+  carries only tracked files, so without this a target repo's suite is
+  unrunnable and the worker commits code it cannot verify. This does mean a
+  session executes arbitrary code from the network inside its worktree.
+  Revisit before running unattended against a repo whose dependency list is
+  not trusted.
 - **Backlog label:** `my-coder` (issues my-coder itself needs — bugs in the
   tool. It does not pick up arbitrary fleet backlog items; `my-orchestrator`
   picks those and hands them to my-coder as the worker.)

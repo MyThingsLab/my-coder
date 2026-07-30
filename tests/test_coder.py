@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from mythings.github import GitHub
@@ -9,10 +11,15 @@ from mythings.ledger import Ledger
 from mythings.policy import Action, Decision, PolicyResult
 from mythings.testing import FakeGh, make_git_repo
 
-from mycoder.coder import Coder
+from mycoder.coder import _BLOCKED_SENTINEL, Coder, default_test_command
 from mycoder.session import NoopSessionRunner, SessionResult
 
 SLUG = "MyThingsLab/my-raytracer"
+OUT_OF_FLEET_SLUG = "someone-else/their-repo"
+
+# Not the literal "python": this suite runs on hosts without that shim, which is
+# the bug these fixtures used to trip over (my-coder#12).
+_PY = default_test_command()[:1]
 
 
 class FakeSessionRunner:
@@ -131,15 +138,15 @@ def _issue(number: int, title: str, body: str = "") -> str:
     )
 
 
-def _github(gh: FakeGh) -> GitHub:
-    return GitHub(SLUG, runner=gh)
+def _github(gh: FakeGh, slug: str = SLUG) -> GitHub:
+    return GitHub(slug, runner=gh)
 
 
-def _coder(repo_path, gh, ledger_path, runner, **kwargs) -> Coder:
+def _coder(repo_path, gh, ledger_path, runner, *, slug: str = SLUG, **kwargs) -> Coder:
     return Coder(
         repo=repo_path,
-        repo_slug=SLUG,
-        github=_github(gh),
+        repo_slug=slug,
+        github=_github(gh, slug),
         ledger=Ledger(ledger_path),
         session_runner=runner,
         **kwargs,
@@ -259,7 +266,7 @@ def test_build_checkpoints_commits_when_generated_code_fails_tests(
     ledger_path = tmp_path / "ledger.jsonl"
     runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
     coder = _coder(
-        repo.path, gh, ledger_path, runner, run_tests=True, test_command=["python", "-c", "exit(1)"]
+        repo.path, gh, ledger_path, runner, run_tests=True, test_command=[*_PY, "-c", "exit(1)"]
     )
     result = coder.run(issue_number=5)
 
@@ -287,7 +294,7 @@ def test_build_fails_when_checkpoint_push_also_fails(tmp_path, clean_git_env, at
         ledger_path,
         runner,
         run_tests=True,
-        test_command=["python", "-c", "exit(1)"],
+        test_command=[*_PY, "-c", "exit(1)"],
         git=flaky_git,
     )
     result = coder.run(issue_number=5)
@@ -306,7 +313,7 @@ def test_build_resumes_from_a_checkpointed_branch(tmp_path, clean_git_env, atten
     ledger_path = tmp_path / "ledger.jsonl"
     first = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
     coder = _coder(
-        repo.path, gh, ledger_path, first, run_tests=True, test_command=["python", "-c", "exit(1)"]
+        repo.path, gh, ledger_path, first, run_tests=True, test_command=[*_PY, "-c", "exit(1)"]
     )
     first_result = coder.run(issue_number=5)
     assert first_result.outcome == "needs_review"
@@ -448,7 +455,7 @@ def test_prompt_carries_a_style_anchor_from_existing_code(tmp_path, clean_git_en
 
 
 _FIXED_TEST_CMD = [
-    "python",
+    *_PY,
     "-c",
     "import pathlib, sys; sys.exit(0 if pathlib.Path('pkg/fixed.txt').exists() else 1)",
 ]
@@ -541,9 +548,7 @@ def test_default_max_attempts_is_one_unchanged_behavior(tmp_path, clean_git_env,
     gh = FakeGh({("issue", "list"): _issue(5, "never fixed")})
     ledger_path = tmp_path / "ledger.jsonl"
     runner = SequencedSessionRunner([{"pkg/a.py": "a = 1\n"}])
-    coder = _coder(
-        repo.path, gh, ledger_path, runner, run_tests=True, test_command=_FIXED_TEST_CMD
-    )
+    coder = _coder(repo.path, gh, ledger_path, runner, run_tests=True, test_command=_FIXED_TEST_CMD)
     result = coder.run(issue_number=5)
 
     assert result.outcome == "needs_review"
@@ -698,3 +703,133 @@ def test_prompt_has_no_research_section_when_nothing_matches(tmp_path, clean_git
 
     prompt = runner.calls[0]
     assert "Prior research on" not in prompt
+
+
+def test_default_test_command_resolves_an_interpreter_that_exists(monkeypatch) -> None:
+    # my-coder#12: the old default was the literal "python", absent on any host
+    # without the python-is-python3 shim.
+    assert shutil.which(default_test_command()[0]) or default_test_command()[0] == sys.executable
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert default_test_command()[0] == sys.executable
+
+
+def test_an_unrunnable_test_command_is_an_outcome_not_a_traceback(
+    tmp_path, clean_git_env, attended_env
+):
+    # my-coder#12: a test command that cannot be launched used to raise
+    # FileNotFoundError out of the run, throwing away the session's commits.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a thing")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=["mycoder-no-such-interpreter"],
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert "could not run test command" in result.detail
+    assert result.tests_passed is False
+    # The work still reached origin rather than dying with the worktree.
+    assert "a = 1" in repo.read_committed("mycoder/my-raytracer-5", "pkg/a.py")
+    assert not any(c[:2] == ["pr", "create"] for c in gh.calls)
+
+
+def test_style_anchor_finds_exemplars_in_a_flat_layout_repo(tmp_path, clean_git_env, attended_env):
+    # my-coder#13: requiring a src/ or tests/ prefix blanked the anchor on every
+    # repo not scaffolded from my-template.
+    repo = make_git_repo(
+        tmp_path,
+        files={
+            "model.py": "MARKER_FLAT = 42\n" + "# pad\n" * 50,
+            "build/generated.py": "MARKER_GENERATED = 1\n" + "# pad\n" * 200,
+        },
+    )
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "fix the model"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/11",
+        }
+    )
+    runner = FakeSessionRunner(files={"model.py": "MARKER_FLAT = 43\n"})
+    _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "MARKER_FLAT = 42" in prompt
+    assert "early/greenfield" not in prompt
+    # Generated output is never house style, even when it is the largest file.
+    assert "MARKER_GENERATED" not in prompt
+
+
+def test_out_of_fleet_target_gets_no_cross_org_protocol(tmp_path, clean_git_env, attended_env):
+    # my-coder#14: a session on someone else's repo was told to file issues into
+    # MyThingsLab, where the `critical` label halts fleet dispatch org-wide.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "fix the model"),
+            ("pr", "create"): f"https://github.com/{OUT_OF_FLEET_SLUG}/pull/3",
+        }
+    )
+    runner = FakeSessionRunner(files={"model.py": "MARKER = 2\n"})
+    _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner, slug=OUT_OF_FLEET_SLUG).run(
+        issue_number=5
+    )
+
+    prompt = runner.calls[0]
+    assert "gh issue create" not in prompt
+    assert "FLEET-DISPATCH-BLOCKED" not in prompt
+    assert "halts new fleet dispatch" not in prompt
+    assert "outside the MyThingsLab fleet" in prompt
+    assert "do NOT use `gh` at all" in prompt
+
+
+def test_in_fleet_target_keeps_the_blocker_protocol(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path, files={"src/pkg/thing.py": "MARKER = 1\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "extend thing"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/11",
+        }
+    )
+    runner = FakeSessionRunner(files={"src/pkg/thing.py": "MARKER = 2\n"})
+    _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "gh issue create --repo MyThingsLab/<repo>" in prompt
+    assert f"{_BLOCKED_SENTINEL} MyThingsLab/<repo>#<number>" in prompt
+
+
+def test_target_conventions_supersede_the_fleet_style_mandate(
+    tmp_path, clean_git_env, attended_env
+):
+    # my-coder#14: the prompt calls the target's CLAUDE.md "authoritative here"
+    # and then mandates fleet house style underneath it.
+    repo = make_git_repo(
+        tmp_path,
+        files={
+            "model.py": "MARKER = 1\n",
+            "CLAUDE.md": "# target\n\nNo docstrings. Comment why, never what.\n",
+        },
+    )
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "fix the model"),
+            ("pr", "create"): f"https://github.com/{OUT_OF_FLEET_SLUG}/pull/3",
+        }
+    )
+    runner = FakeSessionRunner(files={"model.py": "MARKER = 2\n"})
+    _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner, slug=OUT_OF_FLEET_SLUG).run(
+        issue_number=5
+    )
+
+    prompt = runner.calls[0]
+    assert "Comment why, never what." in prompt
+    assert "from __future__ import annotations" not in prompt
+    assert "they win over any habit of" in prompt

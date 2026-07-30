@@ -80,3 +80,38 @@ def test_build_failure_returns_nonzero(capsys):
 
     rc = main(["build", "--repo", "o/r", "--issue", "5"], coder_factory=Failing)
     assert rc == 1
+
+
+def test_build_parses_a_shell_quoted_test_command(capsys):
+    # my-coder#15: without this an operator cannot point --run-tests at an
+    # environment where the target repo's dependencies are importable.
+    _, coder, _ = _build(
+        [
+            "--repo",
+            "o/r",
+            "--issue",
+            "5",
+            "--run-tests",
+            "--test-command",
+            "/tmp/venv/bin/python -m pytest -q",
+        ],
+        capsys,
+    )
+    assert coder.kwargs["test_command"] == ["/tmp/venv/bin/python", "-m", "pytest", "-q"]
+
+
+def test_build_defaults_the_test_command_to_none(capsys):
+    _, coder, _ = _build(["--repo", "o/r", "--issue", "5"], capsys)
+    assert coder.kwargs["test_command"] is None
+
+
+def test_claude_runner_is_fleet_scoped_by_the_target_slug(capsys):
+    _build(
+        ["--repo", "MyThingsLab/my-raytracer", "--issue", "5", "--session-runner", "claude"], capsys
+    )
+    in_fleet = StubCoder.instances[-1].kwargs["session_runner"]
+    assert "Bash(gh issue create*)" in in_fleet._allowed_tools
+
+    _build(["--repo", "someone-else/theirs", "--issue", "5", "--session-runner", "claude"], capsys)
+    out_of_fleet = StubCoder.instances[-1].kwargs["session_runner"]
+    assert "Bash(gh issue create*)" not in out_of_fleet._allowed_tools

@@ -12,13 +12,14 @@ from mythings import _secrets
 
 # The tools a headless worker session may use, ported from the fleet's proven
 # worker invocation (my-fleet `fleet_dispatch.DEFAULT_ALLOWED_TOOLS`): Read/Edit/
-# Write plus git, the test runner, the linter, and non-mutating shell
-# inspection. `rm`/`pip`/`find` stay off (they mutate or run code); `gh` stays
-# off except the two narrow escapes the blocker/critical-bug protocol needs
-# (filing an issue in ANOTHER repo) — a v0 my-coder session otherwise edits and
-# *commits* only, and my-coder itself owns the single push + draft-PR side
-# effect for the target repo so that one step is the only thing Policy/Guard
-# has to gate.
+# Write plus git, the test runner, the linter, dependency installation, and
+# non-mutating shell inspection. `rm`/`find` stay off, and so does any bare
+# `pip`/`uv` — only their install subcommands are admitted (see below); `gh`
+# stays off except the two narrow escapes the blocker/critical-bug protocol
+# needs (filing an issue in ANOTHER repo), and those are withheld outside the
+# fleet. A my-coder session otherwise edits and *commits* only, and my-coder
+# itself owns the single push + draft-PR side effect for the target repo so that
+# one step is the only thing Policy/Guard has to gate.
 ALLOWED_TOOLS = [
     "Read",
     "Edit",
@@ -41,7 +42,35 @@ ALLOWED_TOOLS = [
     "Bash(printenv*)",
     "Bash(env)",
     "Bash(python3 -m venv*)",
+    "Bash(uv venv*)",
+    # Install subcommands only, never bare `pip`/`uv`. A worktree carries only
+    # tracked files, so a target repo's dependencies are absent and its suite is
+    # unrunnable -- the session was being told to leave tests green with no way
+    # to run them (my-coder#15). This is a deliberate widening of the sandbox:
+    # installing a package executes arbitrary code from the network inside the
+    # worktree. Accepted because the alternative is a worker that commits code
+    # it cannot verify; revisit before running unattended against a repo whose
+    # dependency list is not trusted.
+    "Bash(pip install*)",
+    "Bash(pip3 install*)",
+    "Bash(uv pip install*)",
+    "Bash(uv sync*)",
+    "Bash(python -m pip install*)",
+    "Bash(python3 -m pip install*)",
 ]
+
+# Withheld when the target repo is outside the fleet: `gh issue create` exists
+# only for the in-org blocker/critical-bug protocol, and the `critical` label it
+# uses halts fleet dispatch org-wide. A session pointed at someone else's repo
+# must not be able to reach into the org at all (my-coder#14).
+FLEET_ONLY_TOOLS = frozenset({"Bash(gh issue create*)"})
+
+
+def allowed_tools(*, in_fleet: bool = True) -> list[str]:
+    if in_fleet:
+        return list(ALLOWED_TOOLS)
+    return [t for t in ALLOWED_TOOLS if t not in FLEET_ONLY_TOOLS]
+
 
 # Passed as `--disallowedTools`: never burn tokens reading generated/vendored/
 # provenance noise, and never rewrite the venv or dev-ledger. The session is
@@ -147,8 +176,10 @@ class ClaudeSessionRunner:
         self,
         *,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        in_fleet: bool = True,
     ) -> None:
         self._runner = runner
+        self._allowed_tools = allowed_tools(in_fleet=in_fleet)
 
     def run(
         self,
@@ -182,7 +213,7 @@ class ClaudeSessionRunner:
             "--disallowedTools",
             *DENY_READS,
             "--allowedTools",
-            *ALLOWED_TOOLS,
+            *self._allowed_tools,
         ]
         try:
             proc = self._runner(

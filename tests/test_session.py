@@ -9,6 +9,7 @@ from mycoder.session import (
     ClaudeSessionRunner,
     NoopSessionRunner,
     _parse_result,
+    allowed_tools,
     child_env,
     redact_secrets,
 )
@@ -145,3 +146,39 @@ def test_noop_runner_never_changes_anything() -> None:
     )
     assert result.ok is True
     assert result.turns == 0
+
+
+def test_allowlist_admits_install_subcommands_but_not_bare_installers() -> None:
+    # my-coder#15: a worktree carries only tracked files, so a target repo's
+    # dependencies must be installable or its suite is unrunnable.
+    assert "Bash(uv pip install*)" in ALLOWED_TOOLS
+    assert "Bash(pip install*)" in ALLOWED_TOOLS
+    assert "Bash(python3 -m pip install*)" in ALLOWED_TOOLS
+    # Install only -- never a bare installer that could uninstall or reconfigure.
+    assert "Bash(pip*)" not in ALLOWED_TOOLS
+    assert "Bash(uv*)" not in ALLOWED_TOOLS
+
+
+def test_out_of_fleet_session_cannot_reach_github() -> None:
+    # my-coder#14: `gh issue create` exists only for the in-org blocker protocol,
+    # and the `critical` label it uses halts fleet dispatch org-wide.
+    assert "Bash(gh issue create*)" in allowed_tools(in_fleet=True)
+    assert "Bash(gh issue create*)" not in allowed_tools(in_fleet=False)
+    # Nothing else is withheld.
+    assert set(allowed_tools(in_fleet=True)) - set(allowed_tools(in_fleet=False)) == {
+        "Bash(gh issue create*)"
+    }
+
+
+def test_runner_passes_the_out_of_fleet_allowlist_to_claude(tmp_path) -> None:
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout=_RESULT_LINE + "\n", stderr="")
+
+    ClaudeSessionRunner(runner=fake_run, in_fleet=False).run(
+        prompt="p", cwd=tmp_path, max_budget_usd=1.0, max_turns=5, timeout_s=10.0
+    )
+    assert "Bash(gh issue create*)" not in seen["argv"]
+    assert "Bash(uv pip install*)" in seen["argv"]
