@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -25,8 +27,60 @@ BACKLOG_LABEL = "my-coder"  # my-coder's own bugs; target issues arrive via --is
 
 _BLOCKED_SENTINEL = "FLEET-DISPATCH-BLOCKED:"
 
+FLEET_ORG = "MyThingsLab"
+
+# The blocker + critical-bug escapes only make sense inside the fleet: they file
+# into sibling repos and the `critical` label halts dispatch org-wide. Pointed at
+# a repo outside the org (`--repo someone/theirs`), that is a cross-org side
+# effect a target repo never consented to, so the escapes are withheld entirely
+# rather than retargeted -- there is no sibling repo set to file against.
+_FLEET_PROTOCOL = """\
+If this issue turns out to be blocked by a missing capability in ANOTHER \
+{org} repo (a contract, helper, or fix that repo must land first), do \
+not thrash against it. Use `gh issue create --repo {org}/<repo>` to file \
+a precise issue describing exactly what that repo must add and why, then END \
+your run by printing one final line, exactly:
+  {blocked_sentinel} {org}/<repo>#<number>
+naming the issue you just filed. That records the dependency so this issue is \
+paused, not failed, until the blocker is resolved.
+
+If while working you discover a SEPARATE bug that is a security issue or \
+breaks a core invariant shared across the fleet (a `my-things-core` contract, \
+the build harness, or anything that would let other tools ship broken work on \
+top of it), file it immediately with `gh issue create --label critical --label \
+bug --repo {org}/<repo>` describing exactly what's broken and its blast \
+radius. That label halts new fleet dispatch org-wide until it's closed — do \
+not wait until you finish this task to file it. Filing it does not abort your \
+own work; keep going on this issue unless the critical bug blocks it directly, \
+in which case treat it as a blocker per the paragraph above.
+"""
+
+_OUT_OF_FLEET_PROTOCOL = """\
+This repo is outside the {org} fleet. You have no authority to file issues, \
+open pull requests, or make any change anywhere but this checkout. If this \
+issue turns out to be blocked by something you cannot fix here, do not thrash \
+against it and do not file anything elsewhere: stop, leave whatever partial \
+work is genuinely correct committed, and END your run by explaining precisely \
+what blocks it.
+"""
+
+# Fleet house style, asserted only when the target repo states no style of its
+# own. A repo with a CLAUDE.md has already been told its conventions are
+# "authoritative here"; repeating `from __future__ import annotations` and
+# mandatory type hints underneath that contradicts it.
+_FLEET_STYLE_RULE = """\
+- Match the conventions of the existing code shown above: module layout, import
+  style (e.g. `from __future__ import annotations`), type hints on EVERY
+  signature (test functions included), naming, and the existing test style. When
+  in doubt, imitate the nearest existing file rather than inventing a style."""
+
+_TARGET_STYLE_RULE = """\
+- Follow the target-repo conventions quoted above; they win over any habit of
+  yours. For anything they leave unsaid, imitate the nearest existing file in
+  the repo rather than inventing a style."""
+
 _PROMPT = """\
-You are MyCoder, the MyThingsLab fleet's worker. Close this one GitHub issue in \
+You are MyCoder, the {org} fleet's worker. Close this one GitHub issue in \
 {repo} by editing files in the current checkout.
 
 Issue #{number}: {title}
@@ -46,37 +100,64 @@ watching and no one can approve a permission prompt. If a command is denied, \
 do NOT ask for approval or wait for it — it will never come. Work only with \
 the tools you already have.
 
-If this issue turns out to be blocked by a missing capability in ANOTHER \
-MyThingsLab repo (a contract, helper, or fix that repo must land first), do \
-not thrash against it. Use `gh issue create --repo MyThingsLab/<repo>` to file \
-a precise issue describing exactly what that repo must add and why, then END \
-your run by printing one final line, exactly:
-  {blocked_sentinel} MyThingsLab/<repo>#<number>
-naming the issue you just filed. That records the dependency so this issue is \
-paused, not failed, until the blocker is resolved.
-
-If while working you discover a SEPARATE bug that is a security issue or \
-breaks a core invariant shared across the fleet (a `my-things-core` contract, \
-the build harness, or anything that would let other tools ship broken work on \
-top of it), file it immediately with `gh issue create --label critical --label \
-bug --repo MyThingsLab/<repo>` describing exactly what's broken and its blast \
-radius. That label halts new fleet dispatch org-wide until it's closed — do \
-not wait until you finish this task to file it. Filing it does not abort your \
-own work; keep going on this issue unless the critical bug blocks it directly, \
-in which case treat it as a blocker per the paragraph above.
-
+{protocol}
 Rules:
 - Make the smallest change that fully closes the issue, with tests.
-- Match the conventions of the existing code shown above: module layout, import
-  style (e.g. `from __future__ import annotations`), type hints on EVERY
-  signature (test functions included), naming, and the existing test style. When
-  in doubt, imitate the nearest existing file rather than inventing a style.
-- Run the repo's own test suite and linter; leave them green.
-- Commit your work with git and a clear message. Do NOT run `git push`, and do \
-NOT use any `gh` command other than `gh issue create` for a blocker/critical bug \
-above — MyCoder pushes the branch and opens the draft PR.
+{style_rule}
+- Run the repo's own test suite and linter; leave them green. If its
+  dependencies are missing from this checkout, install them first (the repo's
+  own declared dependencies only) and then run the suite.
+- Commit as you go, not once at the end. You are on a wall clock and may be
+  killed mid-run; anything uncommitted at that moment is unverified work
+  someone else has to review. Commit each coherent step as soon as it stands
+  on its own, even before the suite is green.
+- Commit your work with git and a clear message. Do NOT run `git push`{gh_rule}
 - Stay entirely within this repo's checkout; never touch another repo.
 """
+
+_FLEET_GH_RULE = """, and do \
+NOT use any `gh` command other than `gh issue create` for a blocker/critical bug \
+above — MyCoder pushes the branch and opens the draft PR."""
+
+_OUT_OF_FLEET_GH_RULE = """, and do NOT use `gh` at all — \
+MyCoder pushes the branch and opens the draft PR."""
+
+# Generated, vendored or provenance directories: present in the tree but never
+# evidence of the repo's house style. Everything else counts, whatever the
+# layout -- requiring a `src/` package silently blanked the anchor on every
+# flat-layout repo (my-coder#13).
+_ANCHOR_NOISE = frozenset(
+    {
+        ".venv",
+        "venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "vendor",
+        "third_party",
+        "migrations",
+        "dev-ledger",
+        ".mythings",
+    }
+)
+
+
+def _is_anchor_noise(rel: str) -> bool:
+    return any(part in _ANCHOR_NOISE for part in Path(rel).parts)
+
+
+def default_test_command() -> list[str]:
+    # "python" is absent on any distro without the python-is-python3 shim -- and
+    # a missing interpreter used to surface as FileNotFoundError out of the run
+    # rather than as a failing suite (my-coder#12). Resolve one that exists;
+    # sys.executable is the last resort because in a target-repo worktree it is
+    # my-coder's own interpreter, which has the fleet's dependencies, not the
+    # target's.
+    for name in ("python3", "python"):
+        if shutil.which(name):
+            return [name, "-m", "pytest", "-q"]
+    return [sys.executable, "-m", "pytest", "-q"]
 
 
 class _AllowAll:
@@ -172,7 +253,7 @@ class Coder:
         self.policy = policy or _AllowAll()
         self.base = base
         self.run_tests = run_tests
-        self.test_command = test_command or ["python", "-m", "pytest", "-q"]
+        self.test_command = test_command or default_test_command()
         self.max_budget_usd = max_budget_usd
         # A cap too low is indistinguishable from a real failure: a session that
         # hits it exits `is_error`. Default generously; a small issue already
@@ -222,7 +303,7 @@ class Coder:
         except RuntimeError:
             return ""
         exemplars = sorted(
-            (p for p in listed if p.endswith(".py") and (p.startswith(("src/", "tests/")))),
+            (p for p in listed if p.endswith(".py") and not _is_anchor_noise(p)),
             key=lambda p: (tree / p).stat().st_size if (tree / p).is_file() else 0,
             reverse=True,
         )[:max_files]
@@ -293,8 +374,25 @@ class Coder:
                 break
         return "\n\n".join(blocks) + "\n\n" if blocks else ""
 
+    def in_fleet(self) -> bool:
+        # No slug at all means a bare local invocation inside the fleet's own
+        # workspace, which is how every existing caller runs; only an explicit
+        # out-of-org slug withholds the cross-repo escapes.
+        if not self.repo_slug:
+            return True
+        return self.repo_slug.split("/")[0] == FLEET_ORG
+
     def _prompt(self, issue: Issue, tree: Path, *, prior_commits: int = 0) -> str:
+        fleet = self.in_fleet()
+        conventions = self._conventions(tree)
+        protocol = (
+            _FLEET_PROTOCOL.format(org=FLEET_ORG, blocked_sentinel=_BLOCKED_SENTINEL)
+            if fleet
+            else _OUT_OF_FLEET_PROTOCOL.format(org=FLEET_ORG)
+        )
+        stated_own_style = not conventions.startswith("(no ")
         return _PROMPT.format(
+            org=FLEET_ORG,
             repo=self.repo_slug or self._repo_name(),
             number=issue.number,
             title=issue.title,
@@ -302,9 +400,11 @@ class Coder:
             resume_note=self._resume_note(prior_commits),
             relevant_files=self._relevant_files(tree, issue),
             research_context=self._research_context(issue),
-            conventions=self._conventions(tree),
+            conventions=conventions,
             style_anchor=self._style_anchor(tree),
-            blocked_sentinel=_BLOCKED_SENTINEL,
+            protocol=protocol,
+            style_rule=_TARGET_STYLE_RULE if stated_own_style else _FLEET_STYLE_RULE,
+            gh_rule=_FLEET_GH_RULE if fleet else _OUT_OF_FLEET_GH_RULE,
         )
 
     def _commit_count(self, tree: Path, base_sha: str) -> int:
@@ -314,6 +414,48 @@ class Coder:
     def _changed_files(self, tree: Path, base_sha: str) -> list[str]:
         out = self._git(tree, ["diff", "--name-only", f"{base_sha}..HEAD"]).strip()
         return [line for line in out.splitlines() if line]
+
+    def _is_dirty(self, tree: Path) -> bool:
+        return bool(self._git(tree, ["status", "--porcelain"]).strip())
+
+    def _salvage(self, tree: Path, issue: Issue) -> bool:
+        # A session killed by the wall clock has usually made its edits and not
+        # reached `git commit` -- it commits last, after the suite is green.
+        # Those edits used to die with the worktree (my-coder#19). Bank them as
+        # a checkpoint so the next attempt resumes instead of restarting.
+        # Environment directories are excluded explicitly rather than trusted to
+        # the target's .gitignore: a session may well have built a multi-GB venv
+        # in here, and this commit gets pushed.
+        try:
+            self._git(
+                tree,
+                [
+                    "add",
+                    "-A",
+                    "--",
+                    ".",
+                    ":(exclude).venv",
+                    ":(exclude)venv",
+                    ":(exclude)node_modules",
+                    ":(exclude)__pycache__",
+                ],
+            )
+            staged = self._git(tree, ["diff", "--cached", "--name-only"]).strip()
+            if not staged:
+                return False
+            self._git(
+                tree,
+                [
+                    "commit",
+                    "-m",
+                    f"Checkpoint uncommitted work on #{issue.number}\n\n"
+                    "Salvaged by MyCoder: the session ended before committing. This is "
+                    "unverified work-in-progress, not a session's own considered commit.",
+                ],
+            )
+        except RuntimeError:
+            return False
+        return True
 
     def _existing_branch_ref(self, branch: str) -> str | None:
         # A prior run may have checkpointed commits on this issue's branch
@@ -334,9 +476,17 @@ class Coder:
             return str(exc)
         return None
 
-    def _tests_pass(self, tree: Path) -> bool:
-        proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
-        return proc.returncode == 0
+    def _tests_pass(self, tree: Path) -> tuple[bool, str | None]:
+        # A test command that cannot even be launched (no such interpreter, not
+        # executable) is an operator misconfiguration, not a failing suite. It
+        # used to raise out of _attempt and abort the run with a traceback,
+        # discarding the session's committed work; report it as a verdict with
+        # its own reason instead (my-coder#12).
+        try:
+            proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
+        except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+            return False, f"could not run test command {' '.join(self.test_command)!r}: {exc}"
+        return proc.returncode == 0, None
 
     def _pr_body(self, issue: Issue, files: list[str]) -> str:
         listed = "\n".join(f"- `{f}`" for f in files) or "- (none reported)"
@@ -467,6 +617,11 @@ class Coder:
                     blocker=blocker,
                 )
 
+            salvaged = False
+            if commits == 0 and self._is_dirty(tree):
+                salvaged = self._salvage(tree, issue)
+                commits = self._commit_count(tree, base_sha) if salvaged else commits
+
             if commits == 0:
                 # Nothing durable to keep: an errored session that committed
                 # nothing is a real failure; a clean one is an honest no-op.
@@ -480,8 +635,46 @@ class Coder:
 
             files = self._changed_files(tree, base_sha)
 
-            if self.run_tests and not self._tests_pass(tree):
-                base_detail = f"generated code for #{issue.number} failed the test suite"
+            if salvaged:
+                # Never a PR: nothing here passed the session's own review, let
+                # alone a test run. Push it so the next attempt resumes from it.
+                base_detail = (
+                    f"session ended without committing ({session.error or 'no error reported'}); "
+                    f"uncommitted work salvaged for #{issue.number}"
+                )
+                push_error = self._push(tree, branch)
+                if push_error is not None:
+                    detail = f"{base_detail}; checkpoint push also failed: {push_error}"
+                    self._record("failure", detail, files_touched=files, **common)
+                    return Result(
+                        "failure",
+                        detail,
+                        issue=issue.number,
+                        files_touched=files,
+                        cost_usd=session.cost_usd,
+                    )
+                detail = f"{base_detail} onto {branch} -- re-run to resume and finish"
+                self._record(
+                    "needs_review",
+                    detail,
+                    files_touched=files,
+                    branch=branch,
+                    salvaged=True,
+                    **common,
+                )
+                return Result(
+                    "needs_review",
+                    detail,
+                    issue=issue.number,
+                    files_touched=files,
+                    cost_usd=session.cost_usd,
+                )
+
+            tests_ok, test_error = self._tests_pass(tree) if self.run_tests else (True, None)
+            if not tests_ok:
+                base_detail = test_error or (
+                    f"generated code for #{issue.number} failed the test suite"
+                )
                 push_error = self._push(tree, branch)
                 if push_error is not None:
                     # Nothing durable reached origin either -- this really is a

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 
 from mythings.github import GitHub
 from mythings.ledger import Ledger
 
-from mycoder.coder import Coder, Result, default_guarded_policy
+from mycoder.coder import FLEET_ORG, Coder, Result, default_guarded_policy
 from mycoder.session import ClaudeSessionRunner, NoopSessionRunner, SessionRunner
 
 
@@ -38,8 +39,8 @@ def _json(result: Result) -> str:
     )
 
 
-def _runner(name: str) -> SessionRunner:
-    return ClaudeSessionRunner() if name == "claude" else NoopSessionRunner()
+def _runner(name: str, *, in_fleet: bool = True) -> SessionRunner:
+    return ClaudeSessionRunner(in_fleet=in_fleet) if name == "claude" else NoopSessionRunner()
 
 
 def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -> int:
@@ -90,6 +91,13 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         help="re-run the target repo's tests in the worktree before opening the PR",
     )
     build.add_argument(
+        "--test-command",
+        default=None,
+        help="command --run-tests runs, as one shell-quoted string (default: pytest under the "
+        "first interpreter found on PATH). Point this at a prepared environment when the "
+        "target repo's dependencies are not importable from the ambient interpreter",
+    )
+    build.add_argument(
         "--guarded",
         action="store_true",
         help="gate opening the draft PR through myguard.Guard (real ASK-channel human "
@@ -109,15 +117,17 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
     # Keep transcripts next to the ledger (its own provenance dir), not in the
     # invoking CWD — which is often the target repo's checkout.
     transcripts_dir = args.transcripts_dir or args.ledger.parent / "mycoder-transcripts"
+    in_fleet = args.repo.split("/")[0] == FLEET_ORG
     coder = coder_factory(
         repo=args.source,
         repo_slug=args.repo,
         github=GitHub(args.repo),
         ledger=Ledger(args.ledger),
-        session_runner=_runner(args.session_runner),
+        session_runner=_runner(args.session_runner, in_fleet=in_fleet),
         policy=default_guarded_policy() if args.guarded else None,
         base=args.base,
         run_tests=args.run_tests,
+        test_command=shlex.split(args.test_command) if args.test_command else None,
         max_budget_usd=args.max_budget_usd,
         max_turns=args.max_turns,
         session_timeout_s=args.session_timeout_s,
