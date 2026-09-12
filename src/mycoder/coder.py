@@ -18,7 +18,7 @@ from mythings.isolation import Workspace, in_github_actions
 from mythings.ledger import Ledger
 from mythings.policy import ALLOW, Action, Decision, Policy, PolicyResult
 
-from mycoder.session import SessionRunner
+from mycoder.session import SessionRunner, billed
 
 PR_ACTION_KIND = "draft-pr-create"
 
@@ -207,7 +207,11 @@ class Result:
     pr: int | None = None
     files_touched: list[str] = field(default_factory=list)
     tests_passed: bool | None = None
-    cost_usd: float = 0.0  # summed across every attempt, not just the last
+    # Summed across every attempt, not just the last. An attempt whose real cost
+    # could not be recovered (a timeout) contributes its budget cap here rather
+    # than nothing, so this is a floor on spend, never an under-count.
+    cost_usd: float = 0.0
+    cost_known: bool = True  # False once any attempt's true cost was unrecoverable
     attempts: int = 1
     blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
 
@@ -543,16 +547,23 @@ class Coder:
             return Result("skipped", detail, issue=issue_number)
 
         total_cost = 0.0
+        cost_known = True
         result = None
         for attempt in range(1, self.max_attempts + 1):
             result = self._attempt(issue)
+            # `_attempt` already substitutes the budget cap for an unrecoverable
+            # cost, so this sum is a floor on real spend. Before that, a timeout
+            # added 0.0 here and `_RETRYABLE` includes `failure` -- so a
+            # candidate that timed out every time retried forever against a
+            # ceiling that believed nothing had been spent (my-coder#18).
             total_cost += result.cost_usd
+            cost_known = cost_known and result.cost_known
             done = result.outcome not in self._RETRYABLE or attempt == self.max_attempts
             done = done or total_cost >= self.max_total_budget_usd
             if done:
                 break
         assert result is not None
-        return replace(result, cost_usd=total_cost, attempts=attempt)
+        return replace(result, cost_usd=total_cost, cost_known=cost_known, attempts=attempt)
 
     def _attempt(self, issue: Issue) -> Result:
         branch = f"{TOOL}/{self._repo_name()}-{issue.number}"
@@ -579,6 +590,11 @@ class Coder:
                 max_turns=self.max_turns,
                 timeout_s=self.session_timeout_s,
             )
+            # A killed session reports no price at all. Meter it as the cap it
+            # was allowed to spend rather than as zero, so the retry loop and
+            # every ceiling above it see a floor on the real spend (my-coder#18).
+            billed_cost = billed(session.cost_usd, self.max_budget_usd)
+
             transcript_path = self._persist_transcript(issue, session.transcript)
             if session.leaked:
                 self.ledger.record(
@@ -596,7 +612,12 @@ class Coder:
             common: dict[str, object] = {
                 "issue": issue.number,
                 "turns": session.turns,
-                "cost_usd": session.cost_usd,
+                # The metered figure, plus an explicit flag saying whether it is
+                # the real one. A reader of this record must never mistake an
+                # assumed cap for a measured price.
+                "cost_usd": billed_cost,
+                "cost_known": session.cost_usd is not None,
+                "tokens": session.tokens,
                 "final_message": session.final_message[:500],
                 "transcript": transcript_path,
             }
@@ -622,7 +643,8 @@ class Coder:
                     detail,
                     issue=issue.number,
                     files_touched=files,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                     blocker=blocker,
                 )
 
@@ -640,7 +662,13 @@ class Coder:
                     outcome = "failure"
                     detail = f"session failed for #{issue.number} with no commit: {session.error}"
                 self._record(outcome, detail, **common)
-                return Result(outcome, detail, issue=issue.number, cost_usd=session.cost_usd)
+                return Result(
+                    outcome,
+                    detail,
+                    issue=issue.number,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
+                )
 
             files = self._changed_files(tree, base_sha)
 
@@ -660,7 +688,8 @@ class Coder:
                         detail,
                         issue=issue.number,
                         files_touched=files,
-                        cost_usd=session.cost_usd,
+                        cost_usd=billed_cost,
+                        cost_known=session.cost_usd is not None,
                     )
                 detail = f"{base_detail} onto {branch} -- re-run to resume and finish"
                 self._record(
@@ -676,7 +705,8 @@ class Coder:
                     detail,
                     issue=issue.number,
                     files_touched=files,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
 
             tests_ok, test_error = self._tests_pass(tree) if self.run_tests else (True, None)
@@ -698,7 +728,8 @@ class Coder:
                         issue=issue.number,
                         files_touched=files,
                         tests_passed=False,
-                        cost_usd=session.cost_usd,
+                        cost_usd=billed_cost,
+                        cost_known=session.cost_usd is not None,
                     )
                 detail = (
                     f"{base_detail}; branch {branch} pushed as a checkpoint -- "
@@ -718,7 +749,8 @@ class Coder:
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=False,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
             tests_passed: bool | None = True if self.run_tests else None
 
@@ -747,7 +779,8 @@ class Coder:
                     detail,
                     issue=issue.number,
                     files_touched=files,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
 
             # Push the durable commits regardless of how the session ended, so a
@@ -761,7 +794,8 @@ class Coder:
                     detail,
                     issue=issue.number,
                     files_touched=files,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
 
             # Open the draft PR only when the session finished cleanly. A session
@@ -779,7 +813,8 @@ class Coder:
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=tests_passed,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
 
             secret_findings = self._scan_diff_for_secrets(tree, branch)
@@ -804,7 +839,8 @@ class Coder:
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=tests_passed,
-                    cost_usd=session.cost_usd,
+                    cost_usd=billed_cost,
+                    cost_known=session.cost_usd is not None,
                 )
 
             pr = self.github.open_pr(
@@ -831,5 +867,6 @@ class Coder:
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
-            cost_usd=session.cost_usd,
+            cost_usd=billed_cost,
+            cost_known=session.cost_usd is not None,
         )

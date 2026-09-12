@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -10,7 +11,9 @@ from mycoder.session import (
     NoopSessionRunner,
     _parse_result,
     allowed_tools,
+    billed,
     child_env,
+    parse_partial,
     redact_secrets,
 )
 
@@ -138,6 +141,75 @@ def test_claude_runner_handles_a_timeout() -> None:
     assert result.ok is False
     assert "timeout" in (result.error or "")
     assert result.transcript == "partial"
+
+
+def _stream(*objs: dict) -> str:
+    return "\n".join(json.dumps(o) for o in objs)
+
+
+def _assistant(**usage: int) -> dict:
+    return {"type": "assistant", "message": {"role": "assistant", "usage": usage}}
+
+
+def test_a_timeout_never_meters_as_free() -> None:
+    # my-coder#18: a timed-out session recorded cost_usd=0.0, and `failure` is
+    # retryable -- so the priciest way a session can end metered as the cheapest.
+    partial = _stream(
+        {"type": "system", "subtype": "init"},
+        _assistant(input_tokens=10, output_tokens=200),
+        _assistant(input_tokens=5, cache_read_input_tokens=1000, output_tokens=300),
+    )
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0), output=partial)
+
+    result = ClaudeSessionRunner(runner=fake_run).run(
+        prompt="x", cwd=Path("/tmp"), max_budget_usd=3.0, max_turns=40, timeout_s=30.0
+    )
+    assert result.cost_usd is None, "unknown must not collapse to 0.0"
+    assert billed(result.cost_usd, cap=3.0) == 3.0
+    assert result.turns == 2
+    assert result.tokens == 1515
+
+
+def test_billed_passes_a_known_cost_through_untouched() -> None:
+    assert billed(0.42, cap=3.0) == 0.42
+    assert billed(0.0, cap=3.0) == 0.0  # a genuine zero is not the same as unknown
+
+
+def test_parse_partial_ignores_non_assistant_lines_and_junk() -> None:
+    stream = "\n".join(
+        [
+            "not json at all",
+            json.dumps({"type": "user", "message": {"usage": {"output_tokens": 999}}}),
+            json.dumps(_assistant(output_tokens=7)),
+            json.dumps([1, 2, 3]),  # valid json, not an object
+            "",
+        ]
+    )
+    assert parse_partial(stream) == (1, 7)
+
+
+def test_a_settled_stream_still_reports_its_real_cost() -> None:
+    settled = _stream(
+        _assistant(output_tokens=5),
+        {
+            "type": "result",
+            "total_cost_usd": 0.13,
+            "num_turns": 6,
+            "result": "done",
+            "is_error": False,
+        },
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=settled, stderr="")
+
+    result = ClaudeSessionRunner(runner=fake_run).run(
+        prompt="x", cwd=Path("/tmp"), max_budget_usd=3.0, max_turns=40, timeout_s=30.0
+    )
+    assert result.cost_usd == 0.13
+    assert result.turns == 6  # the settled count, not the assistant-line count
 
 
 def test_noop_runner_never_changes_anything() -> None:

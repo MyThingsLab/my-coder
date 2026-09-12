@@ -36,12 +36,15 @@ class FakeSessionRunner:
         error: str | None = None,
         transcript: str = "",
         final_message: str = "done",
+        failure_cost_usd: float | None = 0.0,
     ) -> None:
         self.files = files or {}
         self.ok = ok
         self.commit = commit
         self.leaked = leaked or []
         self.error = error
+        # None models a *timed-out* session, whose real cost is unrecoverable.
+        self.failure_cost_usd = failure_cost_usd
         self.transcript = transcript
         self.final_message = final_message
         self.calls: list[str] = []
@@ -72,6 +75,7 @@ class FakeSessionRunner:
         if not self.ok:
             return SessionResult(
                 ok=False,
+                cost_usd=self.failure_cost_usd,
                 error=self.error or "claude exited 1",
                 leaked=self.leaked,
                 transcript=self.transcript,
@@ -880,6 +884,58 @@ def test_timed_out_session_salvages_its_uncommitted_edits(tmp_path, clean_git_en
     assert "MARKER = 2" in repo.read_committed("mycoder/my-raytracer-5", "model.py")
     # Never a PR: nothing here passed the session's own review or a test run.
     assert not any(c[:2] == ["pr", "create"] for c in gh.calls)
+
+
+def test_repeated_timeouts_stop_at_the_total_budget(tmp_path, clean_git_env, attended_env):
+    # my-coder#18: a timeout carries no price, so it used to add 0.0 to the
+    # running total. `failure` is retryable, so a candidate that timed out every
+    # time retried until max_attempts ran out, against a ceiling that believed
+    # nothing had been spent. Metering unknown as the cap stops it after one.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "fix the model")})
+    runner = FakeSessionRunner(
+        commit=False,
+        ok=False,
+        error="session exceeded 1500s wall-clock timeout",
+        failure_cost_usd=None,  # a real timeout: cost unrecoverable
+    )
+    result = _coder(
+        repo.path,
+        gh,
+        tmp_path / "ledger.jsonl",
+        runner,
+        max_attempts=5,
+        max_budget_usd=3.0,
+        max_total_budget_usd=3.0,
+    ).run(issue_number=5)
+
+    assert result.attempts == 1, "an unknown cost must not meter as free"
+    assert result.cost_usd == 3.0
+    assert result.cost_known is False
+    assert len(runner.calls) == 1
+
+
+def test_a_known_zero_cost_still_allows_retries(tmp_path, clean_git_env, attended_env):
+    # The mirror of the above: a session that genuinely cost nothing is not the
+    # same as one whose cost could not be recovered, and must not be throttled.
+    repo = make_git_repo(tmp_path, files={"model.py": "MARKER = 1\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "fix the model")})
+    runner = FakeSessionRunner(
+        commit=False, ok=False, error="claude exited 1", failure_cost_usd=0.0
+    )
+    result = _coder(
+        repo.path,
+        gh,
+        tmp_path / "ledger.jsonl",
+        runner,
+        max_attempts=3,
+        max_budget_usd=3.0,
+        max_total_budget_usd=3.0,
+    ).run(issue_number=5)
+
+    assert result.attempts == 3
+    assert result.cost_usd == 0.0
+    assert result.cost_known is True
 
 
 def test_salvage_never_commits_an_environment_directory(tmp_path, clean_git_env, attended_env):
