@@ -30,5 +30,10 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Prepended to sys.path, so a git-worktree checkout tests its OWN src rather
+# than the editable install in the shared root .venv -- which points at the
+# main checkout. A worker session runs in a worktree, and without this its
+# suite silently exercises main's code instead of the change under review.
+pythonpath = ["src"]
 addopts = "-q"
 markers = ["slow: integration/slow tests, excluded from the fast local loop"]
