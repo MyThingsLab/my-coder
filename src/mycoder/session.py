@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -133,11 +133,7 @@ def redact_secrets(text: str) -> tuple[str, list[str]]:
     return text, sorted({f.pattern for f in findings})
 
 
-def _parse_result(stdout: str) -> tuple[float, int, str, bool]:
-    # claude's stream-json output ends on one `type=result` line carrying the
-    # settled cost / turn count / final reply; everything before it is
-    # incremental. A truncated or unparsable stream leaves the defaults.
-    cost, turns, final, is_error = 0.0, 0, "", False
+def _iter_objects(stdout: str) -> Iterator[dict]:
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -146,6 +142,52 @@ def _parse_result(stdout: str) -> tuple[float, int, str, bool]:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def parse_partial(stdout: str) -> tuple[int, int]:
+    # A killed stream never carries the settled `type=result` line, so it holds
+    # no dollar figure at all -- only incremental `assistant` lines and their
+    # token `usage`. Recover what is genuinely there: how many assistant
+    # messages were seen and how many tokens they accounted for. Both are
+    # evidence the run was not free; neither is a price, which is why the cost
+    # itself stays unknown rather than being reconstructed from a pricing table
+    # that would drift out of date and lie with confidence.
+    #
+    # `messages` is an *upper* bound on the settled `num_turns` (a thinking-only
+    # message is its own line). It feeds the ledger for diagnostics only -- the
+    # real turn ceiling is enforced by `--max-turns` inside claude.
+    messages = tokens = 0
+    for obj in _iter_objects(stdout):
+        if obj.get("type") != "assistant":
+            continue
+        messages += 1
+        usage = (obj.get("message") or {}).get("usage") or {}
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            tokens += int(usage.get(key) or 0)
+    return messages, tokens
+
+
+def billed(cost_usd: float | None, cap: float) -> float:
+    # An unknown cost meters as the cap, never as zero. A timeout is the most
+    # expensive way a session can end and the only shape carrying no price;
+    # counting it free let a repeatedly-timing-out candidate run well past a
+    # ceiling that believed nothing had been spent (my-coder#18).
+    return cap if cost_usd is None else cost_usd
+
+
+def _parse_result(stdout: str) -> tuple[float, int, str, bool]:
+    # claude's stream-json output ends on one `type=result` line carrying the
+    # settled cost / turn count / final reply; everything before it is
+    # incremental. A truncated or unparsable stream leaves the defaults.
+    cost, turns, final, is_error = 0.0, 0, "", False
+    for obj in _iter_objects(stdout):
         if obj.get("type") == "result":
             cost = float(obj.get("total_cost_usd", 0.0) or 0.0)
             turns = int(obj.get("num_turns", 0) or 0)
@@ -158,7 +200,10 @@ def _parse_result(stdout: str) -> tuple[float, int, str, bool]:
 class SessionResult:
     ok: bool  # process exited 0, no is_error flag, no timeout
     turns: int = 0
-    cost_usd: float = 0.0
+    # None means *unknown*, not free: a killed stream carries no settled price.
+    # Callers must meter it through `billed()` rather than reading it as 0.0.
+    cost_usd: float | None = 0.0
+    tokens: int = 0  # best-effort, from the partial stream; 0 when not recovered
     final_message: str = ""
     transcript: str = ""  # redacted stream-json stdout
     leaked: list[str] = field(default_factory=list)  # secret-pattern names redacted
@@ -239,8 +284,12 @@ class ClaudeSessionRunner:
             if isinstance(raw, bytes):
                 raw = raw.decode(errors="replace")
             clean, leaked = redact_secrets(raw)
+            messages, tokens = parse_partial(clean)
             return SessionResult(
                 ok=False,
+                turns=messages,
+                cost_usd=None,  # unknown, NOT zero -- see `billed()`
+                tokens=tokens,
                 transcript=clean,
                 leaked=leaked,
                 error=f"session exceeded {timeout_s:.0f}s wall-clock timeout",
