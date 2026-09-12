@@ -91,7 +91,7 @@ Issue #{number}: {title}
 {resume_note}\
 {relevant_files}\
 {research_context}\
-Target-repo conventions (its own CLAUDE.md / HARNESS.md, authoritative here):
+Target-repo conventions (its own AGENTS.md / CLAUDE.md / HARNESS.md, authoritative here):
 {conventions}
 
 {style_anchor}
@@ -291,11 +291,15 @@ class Coder:
 
     def _conventions(self, tree: Path) -> str:
         parts = []
-        for name in ("CLAUDE.md", "HARNESS.md"):
+        for name in ("AGENTS.md", "GEMINI.md", "CLAUDE.md"):
             path = tree / name
             if path.exists():
                 parts.append(f"--- {name} ---\n{path.read_text(encoding='utf-8')}")
-        return "\n\n".join(parts) if parts else "(no CLAUDE.md/HARNESS.md found)"
+                break
+        harness = tree / "HARNESS.md"
+        if harness.exists():
+            parts.append(f"--- HARNESS.md ---\n{harness.read_text(encoding='utf-8')}")
+        return "\n\n".join(parts) if parts else "(no AGENTS.md/CLAUDE.md/HARNESS.md found)"
 
     def _style_anchor(self, tree: Path, *, max_files: int = 3, max_chars: int = 6000) -> str:
         # A repo without a CLAUDE.md still has a house style in its existing

@@ -919,6 +919,29 @@ def test_target_conventions_supersede_the_fleet_style_mandate(
     assert "they win over any habit of" in prompt
 
 
+def test_target_conventions_reads_canonical_agents_md(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(
+        tmp_path,
+        files={
+            "model.py": "MARKER = 1\n",
+            "AGENTS.md": "# target agents\n\nCanonical instructions.\n",
+        },
+    )
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(6, "fix the model"),
+            ("pr", "create"): f"https://github.com/{OUT_OF_FLEET_SLUG}/pull/4",
+        }
+    )
+    runner = FakeSessionRunner(files={"model.py": "MARKER = 2\n"})
+    _coder(repo.path, gh, tmp_path / "ledger.jsonl", runner, slug=OUT_OF_FLEET_SLUG).run(
+        issue_number=6
+    )
+
+    prompt = runner.calls[0]
+    assert "Canonical instructions." in prompt
+
+
 def test_timed_out_session_salvages_its_uncommitted_edits(tmp_path, clean_git_env, attended_env):
     # my-coder#19: a session killed by the wall clock has usually made its edits
     # and not reached `git commit`, because it commits last. Those edits used to
