@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 from pathlib import Path
 
+from myguard.ask import ASK_COMMAND_ENV
 from mythings.github import GitHub
 from mythings.ledger import Ledger
 
@@ -114,6 +116,17 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
     build.add_argument("--json", action="store_true", help="print the result as JSON")
 
     args = parser.parse_args(argv)
+    # Preflight, before a paid session runs. `--guarded` turns opening the PR
+    # into an ASK, and Guard resolves an ASK only through MYTHINGS_ASK_CMD.
+    # Unarmed, a session does its work, costs real money, and then cannot open
+    # anything -- which is exactly what happened to three corpus runs (#29).
+    # Refusing up front costs nothing; refusing at the end costs the session.
+    if getattr(args, "guarded", False) and not os.environ.get(ASK_COMMAND_ENV, "").strip():
+        parser.error(
+            f"--guarded needs an ask channel, but {ASK_COMMAND_ENV} is unset, so every PR "
+            "would be blocked after the session had already been paid for. Run under "
+            "fleet_dispatch/fleet_cycle (which arm it), set it yourself, or drop --guarded."
+        )
     # Keep transcripts next to the ledger (its own provenance dir), not in the
     # invoking CWD — which is often the target repo's checkout.
     transcripts_dir = args.transcripts_dir or args.ledger.parent / "mycoder-transcripts"
