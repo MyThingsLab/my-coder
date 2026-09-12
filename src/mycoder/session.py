@@ -182,18 +182,57 @@ def billed(cost_usd: float | None, cap: float) -> float:
     return cap if cost_usd is None else cost_usd
 
 
-def _parse_result(stdout: str) -> tuple[float, int, str, bool]:
+@dataclass(frozen=True)
+class _Result:
+    cost: float = 0.0
+    turns: int = 0
+    final: str = ""
+    is_error: bool = False
+    # claude's own name for *how* it ended -- "error_max_turns",
+    # "error_during_execution", "success". This is the field that separates
+    # "hit a limit" from "crashed", which have opposite fixes.
+    subtype: str = ""
+
+
+def _parse_result(stdout: str) -> _Result:
     # claude's stream-json output ends on one `type=result` line carrying the
     # settled cost / turn count / final reply; everything before it is
     # incremental. A truncated or unparsable stream leaves the defaults.
-    cost, turns, final, is_error = 0.0, 0, "", False
+    result = _Result()
     for obj in _iter_objects(stdout):
         if obj.get("type") == "result":
-            cost = float(obj.get("total_cost_usd", 0.0) or 0.0)
-            turns = int(obj.get("num_turns", 0) or 0)
-            final = str(obj.get("result", "") or "")
-            is_error = bool(obj.get("is_error", False))
-    return cost, turns, final, is_error
+            result = _Result(
+                cost=float(obj.get("total_cost_usd", 0.0) or 0.0),
+                turns=int(obj.get("num_turns", 0) or 0),
+                final=str(obj.get("result", "") or ""),
+                is_error=bool(obj.get("is_error", False)),
+                subtype=str(obj.get("subtype", "") or ""),
+            )
+    return result
+
+
+def describe_failure(returncode: int, result: _Result, stderr: str) -> str:
+    """Build the one string a reader gets when a session ends badly.
+
+    `claude exited 1` is not a diagnosis: hitting the turn cap, hitting the
+    budget cap, crashing on a tool error and emitting something malformed all
+    render identically, and they have completely different fixes. Everything
+    that distinguishes them is already in hand at this point and was being
+    dropped -- claude's own `subtype`, its final message, and the process's
+    stderr, which is the only channel carrying a crash before the stream starts.
+    """
+    parts = [f"claude exited {returncode}"]
+    flags = [f for f in (result.subtype, "is_error" if result.is_error else "") if f]
+    if flags:
+        parts[0] += f" ({', '.join(flags)})"
+    # The final message is the model's own account of why it stopped; stderr is
+    # the runtime's. Either can be empty, and a crash early enough has only the
+    # latter, so neither alone is sufficient.
+    for label, text in (("said", result.final), ("stderr", stderr)):
+        collapsed = " ".join(text.split())
+        if collapsed:
+            parts.append(f"{label}: {collapsed[:300]}")
+    return "; ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -296,18 +335,21 @@ class ClaudeSessionRunner:
             )
 
         clean, leaked = redact_secrets(proc.stdout or "")
-        cost, turns, final, is_error = _parse_result(clean)
-        ok = proc.returncode == 0 and not is_error
+        # stderr goes through the same scrubber as stdout before it reaches a
+        # ledger record: it is untrusted output that now gets persisted.
+        clean_stderr, stderr_leaked = redact_secrets(proc.stderr or "")
+        result = _parse_result(clean)
+        ok = proc.returncode == 0 and not result.is_error
         error = None
         if not ok:
-            error = f"claude exited {proc.returncode}" + (" (is_error)" if is_error else "")
+            error = describe_failure(proc.returncode, result, clean_stderr)
         return SessionResult(
             ok=ok,
-            turns=turns,
-            cost_usd=cost,
-            final_message=final,
+            turns=result.turns,
+            cost_usd=result.cost,
+            final_message=result.final,
             transcript=clean,
-            leaked=leaked,
+            leaked=sorted(set(leaked) | set(stderr_leaked)),
             error=error,
         )
 
