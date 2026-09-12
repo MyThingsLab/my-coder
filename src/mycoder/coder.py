@@ -118,10 +118,10 @@ Rules:
 
 _FLEET_GH_RULE = """, and do \
 NOT use any `gh` command other than `gh issue create` for a blocker/critical bug \
-above — MyCoder pushes the branch and opens the draft PR."""
+above — MyCoder pushes the branch and opens the PR."""
 
 _OUT_OF_FLEET_GH_RULE = """, and do NOT use `gh` at all — \
-MyCoder pushes the branch and opens the draft PR."""
+MyCoder pushes the branch and opens the PR."""
 
 # Generated, vendored or provenance directories: present in the tree but never
 # evidence of the repo's house style. Everything else counts, whatever the
@@ -162,7 +162,7 @@ def default_test_command() -> list[str]:
 
 
 class _AllowAll:
-    # Default gate for the one side effect (a draft PR). The fleet driver injects
+    # Default gate for the one side effect (opening a PR). The fleet driver injects
     # myguard.Guard in production; a lone invocation opens PRs unguarded, same
     # convention as every other tool's template default. `--guarded` opts a CLI
     # invocation into default_guarded_policy() below instead.
@@ -183,7 +183,7 @@ def default_guarded_policy() -> Policy:
             Rule(
                 "draft-pr-needs-a-human",
                 Decision.ASK,
-                "opens a draft PR",
+                "opens a PR (ready when tests passed, draft otherwise)",
                 kind=PR_ACTION_KIND,
             )
         ]
@@ -753,6 +753,17 @@ class Coder:
                     cost_known=session.cost_usd is not None,
                 )
             tests_passed: bool | None = True if self.run_tests else None
+            # Ready when the suite actually ran and passed in this worktree;
+            # draft otherwise. CI skips required checks on a draft, so a PR born
+            # as a draft can never show a green check -- and the fleet's
+            # promotion gate used to read that skip as a pass and promote on it
+            # (my-fleet#32). Opening ready is what makes CI run at all; the
+            # human merge is the gate, not the promotion.
+            #
+            # `tests_passed is None` means --run-tests was off, so nothing was
+            # verified here. That stays a draft: unverified work should not
+            # present itself as reviewable.
+            verified = tests_passed is True
 
             gate = self.policy.evaluate(
                 Action(
@@ -761,7 +772,13 @@ class Coder:
                         "repo": self.repo_slug or self._repo_name(),
                         "issue": issue.number,
                         "branch": branch,
-                        "command": f"gh pr create --head {branch}",
+                        # The human approving this over the ASK channel is
+                        # approving a *reviewable* PR when verified, not a
+                        # draft. Say which, rather than letting the rule's
+                        # static description speak for both.
+                        "draft": not verified,
+                        "command": f"gh pr create --head {branch}"
+                        + ("" if verified else " --draft"),
                     },
                 )
             )
@@ -798,7 +815,7 @@ class Coder:
                     cost_known=session.cost_usd is not None,
                 )
 
-            # Open the draft PR only when the session finished cleanly. A session
+            # Open the PR only when the session finished cleanly. A session
             # that committed real work but ended in error/timeout leaves its
             # branch pushed for a human to resume — durable, but not "done".
             if not session.ok:
@@ -848,21 +865,23 @@ class Coder:
                 body=self._pr_body(issue, files),
                 base=self.base,
                 head=branch,
-                draft=True,
+                draft=not verified,
             )
 
+        kind = "PR" if verified else "draft PR"
         self._record(
             "success",
-            f"opened draft PR #{pr.number} for #{issue.number}",
+            f"opened {kind} #{pr.number} for #{issue.number}",
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
             pr_url=pr.url,
+            draft=not verified,
             **common,
         )
         return Result(
             "success",
-            f"opened draft PR #{pr.number}",
+            f"opened {kind} #{pr.number}",
             issue=issue.number,
             pr=pr.number,
             files_touched=files,

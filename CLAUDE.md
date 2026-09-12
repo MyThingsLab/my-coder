@@ -9,9 +9,9 @@ covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
 ## This tool
 
 - **Purpose:** takes one picked issue (a `Candidate` from `my-orchestrator`,
-  dispatched by `fleet-dispatch`) and closes it as a draft PR: reads the
+  dispatched by `fleet-dispatch`) and closes it as a PR: reads the
   target repo, makes the smallest change with tests, runs its suite and
-  linter, commits, and opens `gh pr create --draft`. This is the fleet's
+  linter, commits, and opens `gh pr create`. This is the fleet's
   **worker** role — formerly inlined in `fleet-dispatch/fleet_dispatch.py`
   (`_prompt_for`/`_dispatch_one`/`_finalize_pr`), now a real, tested, versioned
   tool instead of a workspace script.
@@ -30,13 +30,19 @@ covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
   classification, PR-readiness checks, ledger writes, the blocker protocol —
   stays deterministic, same as every other tool.
 - **Invariants / rules:** every `git`/`gh` side effect the session takes is
-  its own responsibility inside the sandbox, but the PR open/promote steps
-  my-coder performs itself are wrapped as `Action(kind="bash", ...)` through
+  its own responsibility inside the sandbox, but the PR open step my-coder
+  performs itself is wrapped as `Action(kind="bash", ...)` through
   `Policy.evaluate` (MyGuard) first, same as every other tool. Opens at most
-  **one** PR per issue, as a **draft**, head `mycoder/<repo>-<issue-number>`,
-  and never promotes it to ready or merges it — promotion requires the PR
-  body's checklist to hold (`Closes #<n>` + at least one checked box) and CI
-  green; a human always does the actual merge. A session that leaves no
+  **one** PR per issue, head `mycoder/<repo>-<issue-number>`, and never
+  merges it — a human always does that. The PR opens **ready for review**
+  when my-coder's own in-worktree suite ran and passed, and as a **draft**
+  otherwise (`--run-tests` off, so nothing was verified). This is not
+  cosmetic: `ci.yml` skips required checks while a PR is a draft, so a PR
+  born as a draft can never show a green check, and the fleet's old
+  promotion gate read that skip as a pass and promoted on it
+  (`my-fleet#32`). Opening ready is what makes CI run at all; the gate is
+  the **merge**, not the promotion. Nothing in the fleet promotes a draft
+  any more. A session that leaves no
   commit is `outcome=no_changes`; one that commits but doesn't open a PR is
   `outcome=needs_review`; success requires both a real commit *and* an open
   PR. A session may end by filing a cross-repo blocker issue instead

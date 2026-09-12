@@ -488,6 +488,62 @@ _FIXED_TEST_CMD = [
     "import pathlib, sys; sys.exit(0 if pathlib.Path('pkg/fixed.txt').exists() else 1)",
 ]
 
+_PASSING_TEST_CMD = [*_PY, "-c", "exit(0)"]
+
+
+def test_a_verified_pr_opens_ready_not_draft(tmp_path, clean_git_env, attended_env):
+    # my-fleet#32: `ci.yml` skips required checks while a PR is a draft, so a PR
+    # born as a draft could never show a green check -- and the fleet's
+    # promotion gate read that skip as a pass and promoted on it. Opening ready
+    # is what makes CI run at all. The gate moved to the merge, which a human
+    # always performs.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add greet"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/7",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/greet.py": "def greet():\n    return 'hi'\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_PASSING_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.tests_passed is True
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" not in create, "a PR whose suite passed must open ready, or CI never runs"
+    entries = list(Ledger(ledger_path))
+    assert any(e.kind == "code" and e.data.get("draft") is False for e in entries)
+
+
+def test_an_unverified_pr_still_opens_as_a_draft(tmp_path, clean_git_env, attended_env):
+    # The other half of the rule. Without --run-tests nothing was verified in
+    # the worktree, so `tests_passed` is None rather than True. Unverified work
+    # must not present itself as reviewable just because opening ready is now
+    # the norm -- the draft is the honest signal that no suite ran.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add greet"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/7",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/greet.py": "def greet():\n    return 'hi'\n"})
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.tests_passed is None
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" in create
+
 
 def test_build_retries_and_succeeds_on_a_later_attempt(tmp_path, clean_git_env, attended_env):
     # First attempt fails the test suite and checkpoints; a fresh session on
