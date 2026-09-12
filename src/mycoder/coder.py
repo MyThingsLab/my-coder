@@ -782,17 +782,35 @@ class Coder:
                     },
                 )
             )
-            if gate.under(unattended=in_github_actions()) is not Decision.ALLOW:
-                detail = f"policy blocked the PR for #{issue.number}: {gate.reason or gate.rule}"
+            decision = gate.under(unattended=in_github_actions())
+            if decision is not Decision.ALLOW:
+                # A DENY is a human saying no. A surviving ASK is nobody having
+                # *been* asked: Guard resolves an ASK only when MYTHINGS_ASK_CMD
+                # names a channel, so an unarmed run arrives here with the ASK
+                # intact. Reporting both as "denied" made a missing channel
+                # indistinguishable from a refusal, and three paid sessions were
+                # discarded before anyone noticed (#29).
+                if decision is Decision.ASK:
+                    outcome = "needs_human"
+                    detail = (
+                        f"no ask channel to approve the PR for #{issue.number}: "
+                        f"{gate.reason or gate.rule}. Nobody was asked — set "
+                        "MYTHINGS_ASK_CMD, or run under fleet_dispatch"
+                    )
+                else:
+                    outcome = "denied"
+                    detail = (
+                        f"policy blocked the PR for #{issue.number}: {gate.reason or gate.rule}"
+                    )
                 data: dict[str, object] = {"files_touched": files, **common}
-                # Checkpoint even a policy denial, best-effort: the commits are
-                # otherwise thrown away with the worktree on the way out.
+                # Checkpoint either way, best-effort: the commits are otherwise
+                # thrown away with the worktree on the way out.
                 if self._push(tree, branch) is None:
                     data["branch"] = branch
                     detail = f"{detail} (commits checkpointed on {branch})"
-                self._record("denied", detail, **data)
+                self._record(outcome, detail, **data)
                 return Result(
-                    "denied",
+                    outcome,
                     detail,
                     issue=issue.number,
                     files_touched=files,
