@@ -176,6 +176,30 @@ def test_build_commits_and_opens_a_draft_pr(tmp_path, clean_git_env, attended_en
     assert any(e.kind == "code" and e.outcome == "success" and e.data["pr"] == 7 for e in entries)
 
 
+def test_build_blocks_the_pr_when_the_diff_leaks_a_secret(tmp_path, clean_git_env, attended_env):
+    # A session's transcript is redacted (session.py:redact_secrets), but a
+    # commit it makes itself is not -- this is the last gate before that
+    # credential would leave the worktree as a public PR.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add config")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/config.py": "AWS_KEY = 'AKIA1234567890ABCDEF'\n"})
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert not gh.saw("pr", "create")
+    entries = list(Ledger(ledger_path))
+    assert any(
+        e.kind == "secret_alert"
+        and e.outcome == "blocked"
+        and "aws_access_key_id" in e.data["patterns"]
+        for e in entries
+    )
+    assert any(e.kind == "code" and e.outcome == "needs_review" for e in entries)
+    # The branch is still pushed as a checkpoint, so the human can fix it in place.
+    assert "AKIA1234567890ABCDEF" in repo.read_committed("mycoder/my-raytracer-5", "pkg/config.py")
+
+
 def test_build_no_changes_when_session_commits_nothing(tmp_path, clean_git_env, attended_env):
     repo = make_git_repo(tmp_path)
     gh = FakeGh({("issue", "list"): _issue(5, "noop")})

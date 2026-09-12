@@ -12,6 +12,7 @@ from myguard.guard import Guard
 from myguard.rules import Rule
 from mysearcher.searcher import Issue as SearchIssue
 from mysearcher.searcher import Searcher
+from mythings import _secrets
 from mythings.github import GitHub, Issue
 from mythings.isolation import Workspace, in_github_actions
 from mythings.ledger import Ledger
@@ -476,6 +477,14 @@ class Coder:
             return str(exc)
         return None
 
+    def _scan_diff_for_secrets(self, tree: Path, branch: str) -> list[_secrets.Finding]:
+        # session.py's redact_secrets scrubs the transcript, not the commits: a
+        # session can still write a real credential straight into a file. This
+        # is the last chance to catch it, after the branch is safely pushed
+        # (so the checkpoint isn't lost) but before it becomes a public PR.
+        diff_text = self._git(tree, ["diff", "-U0", f"origin/{self.base}...{branch}"])
+        return _secrets.scan_text(_secrets.added_lines(diff_text))
+
     def _tests_pass(self, tree: Path) -> tuple[bool, str | None]:
         # A test command that cannot even be launched (no such interpreter, not
         # executable) is an operator misconfiguration, not a failing suite. It
@@ -762,6 +771,31 @@ class Coder:
                 detail = (
                     f"branch {branch} pushed for #{issue.number}, no PR — session ended "
                     f"early ({session.error}); resume or review the branch"
+                )
+                self._record("needs_review", detail, files_touched=files, branch=branch, **common)
+                return Result(
+                    "needs_review",
+                    detail,
+                    issue=issue.number,
+                    files_touched=files,
+                    tests_passed=tests_passed,
+                    cost_usd=session.cost_usd,
+                )
+
+            secret_findings = self._scan_diff_for_secrets(tree, branch)
+            if secret_findings:
+                patterns = sorted({f.pattern for f in secret_findings})
+                self.ledger.record(
+                    TOOL,
+                    "secret_alert",
+                    "blocked",
+                    f"blocked the PR for #{issue.number}: possible secret(s) in the diff",
+                    issue=issue.number,
+                    patterns=patterns,
+                )
+                detail = (
+                    f"branch {branch} pushed for #{issue.number}, no PR — the diff contains "
+                    f"possible secret(s) ({', '.join(patterns)}); scrub the branch and re-run"
                 )
                 self._record("needs_review", detail, files_touched=files, branch=branch, **common)
                 return Result(
