@@ -24,16 +24,28 @@ _RESULT_LINE = (
 
 def test_parse_result_reads_the_final_result_line() -> None:
     stdout = '{"type":"assistant"}\n' + _RESULT_LINE + "\n"
-    cost, turns, final, is_error = _parse_result(stdout)
-    assert cost == 0.042
-    assert turns == 7
-    assert final == "all done"
-    assert is_error is False
+    result = _parse_result(stdout)
+    assert result.cost == 0.042
+    assert result.turns == 7
+    assert result.final == "all done"
+    assert result.is_error is False
 
 
 def test_parse_result_tolerates_garbage_lines() -> None:
-    cost, turns, final, is_error = _parse_result("not json\n\n")
-    assert (cost, turns, final, is_error) == (0.0, 0, "", False)
+    result = _parse_result("not json\n\n")
+    assert (result.cost, result.turns, result.final, result.is_error) == (0.0, 0, "", False)
+
+
+def test_parse_result_keeps_the_subtype_that_says_how_it_ended() -> None:
+    # "error_max_turns" and "error_during_execution" are a raised limit and a
+    # bug respectively; without the subtype they are the same ledger record.
+    stdout = (
+        '{"type":"result","total_cost_usd":1.95,"num_turns":40,'
+        '"result":"","is_error":true,"subtype":"error_max_turns"}\n'
+    )
+    result = _parse_result(stdout)
+    assert result.subtype == "error_max_turns"
+    assert result.is_error is True
 
 
 def test_redact_secrets_leaves_benign_text_untouched() -> None:
@@ -129,6 +141,69 @@ def test_claude_runner_reports_a_nonzero_exit_as_not_ok() -> None:
     )
     assert result.ok is False
     assert "exited 1" in (result.error or "")
+
+
+def test_a_failed_session_keeps_stderr_in_the_error() -> None:
+    # my-coder#28: "claude exited 1" was the entire diagnosis. stderr is the
+    # only channel carrying a crash that happens before the stream starts, so
+    # dropping it left nothing to tell a bug from a raised limit.
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="Error: ENOSPC: no space left on device"
+        )
+
+    result = ClaudeSessionRunner(runner=fake_run).run(
+        prompt="x", cwd=Path("/tmp"), max_budget_usd=1.0, max_turns=1, timeout_s=1.0
+    )
+
+    assert result.ok is False
+    assert "ENOSPC" in (result.error or "")
+
+
+def test_a_failed_session_names_the_limit_it_hit_and_what_it_said() -> None:
+    # The shape from the first real corpus run: work was done, cost was real,
+    # and the session hit its turn cap. "Raise --max-turns" and "fix the bug"
+    # are different responses, so the subtype has to survive into the record.
+    stream = _stream(
+        {"type": "assistant", "message": {"role": "assistant", "usage": {}}},
+        {
+            "type": "result",
+            "total_cost_usd": 1.95,
+            "num_turns": 40,
+            "result": "I ran out of turns before I could commit.",
+            "is_error": True,
+            "subtype": "error_max_turns",
+        },
+    )
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout=stream, stderr="")
+
+    result = ClaudeSessionRunner(runner=fake_run).run(
+        prompt="x", cwd=Path("/tmp"), max_budget_usd=3.0, max_turns=40, timeout_s=60.0
+    )
+
+    assert result.ok is False
+    error = result.error or ""
+    assert "error_max_turns" in error
+    assert "ran out of turns" in error
+    assert result.cost_usd == 1.95
+
+
+def test_a_failed_sessions_stderr_is_redacted_before_it_is_recorded() -> None:
+    # The error string lands in a ledger record, so stderr gets the same
+    # scrubbing stdout already had rather than becoming a new leak path.
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="auth failed for sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF"
+        )
+
+    result = ClaudeSessionRunner(runner=fake_run).run(
+        prompt="x", cwd=Path("/tmp"), max_budget_usd=1.0, max_turns=1, timeout_s=1.0
+    )
+
+    assert "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF" not in (result.error or "")
+    assert result.leaked, "the redaction must be reported, not silent"
 
 
 def test_claude_runner_handles_a_timeout() -> None:
