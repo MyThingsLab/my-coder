@@ -42,6 +42,8 @@ def _json(result: Result) -> str:
             "cost_usd": result.cost_usd,
             "attempts": result.attempts,
             "blocker": result.blocker,
+            "failing_tests": result.failing_tests,
+            "failure_trace": result.failure_trace,
         }
     )
 
