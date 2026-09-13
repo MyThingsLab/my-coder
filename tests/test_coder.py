@@ -765,6 +765,31 @@ def test_prompt_carries_prior_research_from_the_shared_ledger(
     assert "Cosine-weighted hemisphere sampling cancels the PDF term." in prompt
 
 
+def test_prompt_carries_active_fleet_context_from_env(
+    tmp_path, clean_git_env, attended_env, monkeypatch
+):
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "implement path tracing integrator"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/42",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+
+    monkeypatch.setenv(
+        "MYTHINGS_FLEET_CONTEXT",
+        "Active Fleet Context:\n- Worker 'account2': my-tester#9 in flight",
+    )
+
+    _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    prompt = runner.calls[0]
+    assert "Active Fleet Context:" in prompt
+    assert "Worker 'account2': my-tester#9 in flight" in prompt
+
+
 def test_prompt_has_no_research_section_when_nothing_matches(tmp_path, clean_git_env, attended_env):
     repo = make_git_repo(tmp_path)
     gh = FakeGh(

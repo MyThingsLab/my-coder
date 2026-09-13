@@ -2,3 +2,4 @@
 {"data":{"files":"tests/test_session.py","session":"2026-09-13"},"detail":"Add comprehensive coverage tests for standalone status objects and bytes timeout handling","kind":"test","outcome":"success","tool":"claude-code","ts":"2026-09-13T13:22:09Z"}
 {"data":{"files":"src/mycoder/coder.py,src/mycoder/cli.py,tests/test_coder.py","session":"2026-09-13"},"detail":"Capture deterministic test failure diagnostics in _tests_pass and inject into resume prompt","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-09-13T14:31:21Z"}
 {"data":{"files":"src/mycoder/coder.py,tests/test_coder.py","session":"2026-09-13"},"detail":"AST-prune style anchor exemplar files in _style_anchor to eliminate token bloat","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-09-13T14:35:08Z"}
+{"data":{"session":"2026-09-13"},"detail":"Consume MYTHINGS_FLEET_CONTEXT in worker prompt","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-09-13T15:08:32Z"}

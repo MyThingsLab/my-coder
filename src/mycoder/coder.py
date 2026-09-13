@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 import subprocess
 import sys
@@ -92,6 +93,7 @@ Issue #{number}: {title}
 {resume_note}\
 {relevant_files}\
 {research_context}\
+{fleet_context}\
 Target-repo conventions (its own AGENTS.md / CLAUDE.md / HARNESS.md, authoritative here):
 {conventions}
 
@@ -515,6 +517,10 @@ class Coder:
             return True
         return self.repo_slug.split("/")[0] == FLEET_ORG
 
+    def _fleet_context(self) -> str:
+        ctx = os.environ.get("MYTHINGS_FLEET_CONTEXT", "").strip()
+        return f"{ctx}\n\n" if ctx else ""
+
     def _prompt(
         self,
         issue: Issue,
@@ -543,6 +549,7 @@ class Coder:
             ),
             relevant_files=self._relevant_files(tree, issue),
             research_context=self._research_context(issue),
+            fleet_context=self._fleet_context(),
             conventions=conventions,
             style_anchor=self._style_anchor(tree),
             protocol=protocol,
