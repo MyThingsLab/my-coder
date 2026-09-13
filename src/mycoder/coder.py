@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 import sys
@@ -254,6 +255,35 @@ def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
     return failing_tests, failure_trace
 
 
+def _prune_python_exemplar(source: str, *, max_chars: int = 2000) -> str:
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return source[:max_chars]
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        elif isinstance(node, ast.ClassDef):
+            new_body = []
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    item.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+                    new_body.append(item)
+                elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    new_body.append(item)
+            node.body = new_body or [ast.Pass()]
+
+    try:
+        pruned = ast.unparse(tree)
+    except Exception:
+        return source[:max_chars]
+
+    if not pruned.strip():
+        return source[:max_chars]
+    return pruned[:max_chars]
+
+
 def _parse_blocker(final_message: str) -> str | None:
     for line in final_message.splitlines():
         line = line.strip()
@@ -339,12 +369,14 @@ class Coder:
             parts.append(f"--- HARNESS.md ---\n{harness.read_text(encoding='utf-8')}")
         return "\n\n".join(parts) if parts else "(no AGENTS.md/CLAUDE.md/HARNESS.md found)"
 
-    def _style_anchor(self, tree: Path, *, max_files: int = 3, max_chars: int = 6000) -> str:
+    def _style_anchor(self, tree: Path, *, max_files: int = 3, max_chars: int = 2000) -> str:
         # A repo without a CLAUDE.md still has a house style in its existing
         # code; show the session that code so it matches conventions (type
         # hints, imports, test shape) the first time instead of guessing — the
-        # single biggest source of review-only polish on generated PRs. Largest
-        # files first: more content is a stronger convention signal.
+        # single biggest source of review-only polish on generated PRs.
+        # Exemplar files are pruned via AST to preserve imports, class definitions,
+        # and function signatures while stripping implementation bodies, drastically
+        # cutting token spend. Largest files first: more content is a stronger signal.
         try:
             listed = [p for p in self._git(tree, ["ls-files"]).splitlines() if p]
         except RuntimeError:
@@ -358,14 +390,16 @@ class Coder:
         for rel in exemplars:
             path = tree / rel
             if path.is_file():
-                blocks.append(f"--- {rel} ---\n{path.read_text(encoding='utf-8')[:max_chars]}")
+                raw = path.read_text(encoding="utf-8")
+                pruned = _prune_python_exemplar(raw, max_chars=max_chars)
+                blocks.append(f"--- {rel} ---\n{pruned}")
         if not blocks:
             return "Existing code: (none yet — this is an early/greenfield repo)."
         tree_view = "\n".join(listed[:300])
         return (
             "Existing code in this repo (match its conventions exactly):\n\n"
             f"Repository files:\n{tree_view}\n\n"
-            "Representative existing files:\n\n" + "\n\n".join(blocks)
+            "Representative existing files (signatures and style):\n\n" + "\n\n".join(blocks)
         )
 
     def _last_attempt_diagnostic(self, issue_number: int) -> dict[str, object] | None:
