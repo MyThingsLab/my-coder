@@ -1435,3 +1435,86 @@ def test_parse_test_failures_harvests_collection_errors_but_not_the_banner():
     assert failing == ["tests/test_api.py", "tests/test_other.py::test_two"]
     assert "collecting" not in failing
     assert "ModuleNotFoundError" in trace
+
+
+def test_parse_test_failures_ignores_a_collection_banner_and_a_bare_prefix():
+    from mycoder.coder import _parse_test_failures
+
+    # "ERROR collecting <file>" is pytest's banner for the same error its short
+    # summary already names. Harvesting "collecting" as the node id would make
+    # every collection error in every repo compare equal, so a real regression
+    # would subtract cleanly against an unrelated inherited one.
+    stdout = "ERROR collecting tests/test_api.py\nFAILED\nERROR\nERROR tests/test_api.py - boom\n"
+    failing, _ = _parse_test_failures(stdout, "")
+    assert failing == ["tests/test_api.py"]
+
+
+def test_an_unestablishable_baseline_is_not_treated_as_a_clean_one(
+    tmp_path, clean_git_env, attended_env
+):
+    # The conservative half of my-coder#34: if the base's failures cannot be
+    # determined, the diff keeps the blame. Silently treating "I could not find
+    # out" as "the base was green" would hand out inherited-red amnesty on no
+    # evidence, which is worse than the bug being fixed.
+    from mycoder.coder import _run_git
+
+    def no_baseline_git(tree, argv):
+        if argv[:2] == ["worktree", "add"]:
+            raise RuntimeError("cannot create a worktree here")
+        return _run_git(tree, argv)
+
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_RED_TEST_CMD,
+        git=no_baseline_git,
+    ).run(issue_number=5)
+
+    # The identical command in test_a_red_inherited_from_base_does_not_strand_
+    # the_work opens a draft PR; without a baseline it must not.
+    assert result.outcome == "needs_review"
+    assert result.inherited_failures == []
+    assert not gh.saw("pr", "create")
+
+
+def test_a_baseline_worktree_that_cannot_be_removed_still_yields_a_verdict(
+    tmp_path, clean_git_env, attended_env
+):
+    # Cleanup is best-effort: the throwaway worktree lives under a
+    # TemporaryDirectory that goes away regardless, so a failed `worktree
+    # remove` must not cost the run the verdict it just computed.
+    from mycoder.coder import _run_git
+
+    def unremovable_git(tree, argv):
+        if argv[:2] == ["worktree", "remove"]:
+            raise RuntimeError("worktree is locked")
+        return _run_git(tree, argv)
+
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add a"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/14",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_RED_TEST_CMD,
+        git=unremovable_git,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.inherited_failures == ["tests/test_legacy.py::test_old"]

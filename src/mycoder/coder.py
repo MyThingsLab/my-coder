@@ -251,10 +251,9 @@ def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
         for prefix in ("FAILED ", "ERROR "):
             if not line.startswith(prefix):
                 continue
-            parts = line.split()
-            if len(parts) < 2:
-                break
-            node = parts[1]
+            # The line was stripped before the prefix test, so matching it
+            # guarantees a token after the space -- no length guard needed.
+            node = line.split()[1]
             # "ERROR collecting tests/x.py" is the banner for the very error
             # whose short-summary line we already harvest; taking "collecting"
             # as a node id would make every collection error look identical.
@@ -753,12 +752,13 @@ class Coder:
                 self._git(tree, ["worktree", "add", "--detach", str(base_tree), base_sha])
             except RuntimeError:
                 return None
+            # No launch-error guard here, unlike _tests_pass: this only runs
+            # after that call already launched the same command successfully in
+            # the same process, and `worktree add` above just created the cwd.
             try:
                 proc = subprocess.run(
                     self.test_command, cwd=str(base_tree), capture_output=True, text=True
                 )
-            except (FileNotFoundError, NotADirectoryError, PermissionError):
-                return None
             finally:
                 try:
                     self._git(tree, ["worktree", "remove", "--force", str(base_tree)])
