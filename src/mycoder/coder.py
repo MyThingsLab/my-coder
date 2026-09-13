@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -91,6 +92,7 @@ Issue #{number}: {title}
 {body}
 
 {resume_note}\
+{context_pack}\
 {relevant_files}\
 {research_context}\
 {fleet_context}\
@@ -467,6 +469,61 @@ class Coder:
             )
         return "\n\n".join(parts) + "\n\n"
 
+    def _agent_context_pack(self, tree: Path, issue: Issue) -> str:
+        """Attempt to extract an Agent Context Pack (ACP) from the deterministic codebase graph."""
+        try:
+            from mythings.graph import (
+                CodebaseGraph,
+                MarkdownExtractor,
+                PythonAstExtractor,
+                render_context_pack,
+            )
+        except ImportError:
+            return ""
+
+        cached_db = tree / ".mythings" / "graph.sqlite"
+        if cached_db.exists():
+            graph = CodebaseGraph(cached_db)
+        else:
+            graph = CodebaseGraph.in_memory()
+            try:
+                PythonAstExtractor(repo_root=tree).index_repo(graph)
+                MarkdownExtractor(repo_root=tree).index_docs(graph)
+            except Exception:
+                return ""
+
+        text = f"{issue.title} {issue.body or ''}"
+        words = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", text))
+        matched_symbols = []
+        for w in words:
+            found = graph.find_symbols(w)
+            for s in found:
+                if s.kind in ("function", "method", "class"):
+                    matched_symbols.append(s)
+
+        if not matched_symbols:
+            return ""
+
+        title_lower = issue.title.lower()
+        matched_symbols.sort(
+            key=lambda s: (
+                s.name.lower() in title_lower,
+                s.kind != "class",
+                -(s.end_line or 0) + (s.start_line or 0),
+            ),
+            reverse=True,
+        )
+
+        primary_symbol = matched_symbols[0]
+        try:
+            acp = render_context_pack(graph, primary_symbol.id, repo_root=tree)
+            return (
+                "## Deterministic Agent Context Pack (Grounded Focus & Blast Radius)\n\n"
+                f"{acp}\n\n"
+            )
+        except Exception:
+            return ""
+
     def _relevant_files(self, tree: Path, issue: Issue) -> str:
         # my-searcher's own CLAUDE.md documents this exact hand-off: "a
         # reusable 'which files matter here' step for later tools (MyGroomer,
@@ -547,6 +604,7 @@ class Coder:
             resume_note=self._resume_note(
                 prior_commits, diff_stat=diff_stat, diagnostic=diagnostic
             ),
+            context_pack=self._agent_context_pack(tree, issue),
             relevant_files=self._relevant_files(tree, issue),
             research_context=self._research_context(issue),
             fleet_context=self._fleet_context(),
