@@ -489,3 +489,25 @@ def test_child_env_sanitizes_gemini_and_preserves_config() -> None:
     assert "ANTIGRAVITY_AGENT" not in env
     assert "GEMINI_CLI_TOKEN" not in env
 
+
+def test_parse_result_reads_standalone_status_object() -> None:
+    line = '{"status":"SUCCESS","response":"direct reply","num_turns":3,"cost_usd":0.02}\n'
+    result = _parse_result(line)
+    assert result.final == "direct reply"
+    assert result.turns == 3
+    assert result.cost == 0.02
+    assert result.is_error is False
+
+
+def test_gemini_runner_handles_timeout_with_bytes_output(tmp_path: Path) -> None:
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0), output=b"bytes log")
+
+    runner = GeminiSessionRunner(bin_name="agy", runner=fake_run)
+    result = runner.run(
+        prompt="build", cwd=tmp_path, max_budget_usd=1.0, max_turns=10, timeout_s=30.0
+    )
+    assert result.ok is False
+    assert result.transcript == "bytes log"
+
+
