@@ -1,0 +1,2 @@
+{"data":{"files":"src/mycoder/session.py,src/mycoder/cli.py,tests/test_session.py,tests/test_cli.py","session":"2026-09-13"},"detail":"Implement GeminiSessionRunner and multi-engine runner support in mycoder.session and CLI","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-09-13T13:19:57Z"}
+{"data":{"files":"tests/test_session.py","session":"2026-09-13"},"detail":"Add comprehensive coverage tests for standalone status objects and bytes timeout handling","kind":"test","outcome":"success","tool":"claude-code","ts":"2026-09-13T13:22:09Z"}

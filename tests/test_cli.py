@@ -8,7 +8,7 @@ import pytest
 import mycoder.cli as cli
 from mycoder.cli import main
 from mycoder.coder import Result
-from mycoder.session import ClaudeSessionRunner, NoopSessionRunner
+from mycoder.session import ClaudeSessionRunner, GeminiSessionRunner, NoopSessionRunner
 
 
 class StubCoder:
@@ -50,6 +50,15 @@ def test_build_claude_runner_and_caps(capsys):
         capsys,
     )
     assert isinstance(coder.kwargs["session_runner"], ClaudeSessionRunner)
+    assert coder.kwargs["max_budget_usd"] == 2.5
+
+
+def test_build_gemini_runner_and_caps(capsys):
+    _, coder, _ = _build(
+        ["--repo", "o/r", "--issue", "1", "--session-runner", "gemini", "--max-budget-usd", "2.5"],
+        capsys,
+    )
+    assert isinstance(coder.kwargs["session_runner"], GeminiSessionRunner)
     assert coder.kwargs["max_budget_usd"] == 2.5
 
 
@@ -119,6 +128,18 @@ def test_claude_runner_is_fleet_scoped_by_the_target_slug(capsys):
     assert "Bash(gh issue create*)" in in_fleet._allowed_tools
 
     _build(["--repo", "someone-else/theirs", "--issue", "5", "--session-runner", "claude"], capsys)
+    out_of_fleet = StubCoder.instances[-1].kwargs["session_runner"]
+    assert "Bash(gh issue create*)" not in out_of_fleet._allowed_tools
+
+
+def test_gemini_runner_is_fleet_scoped_by_the_target_slug(capsys):
+    _build(
+        ["--repo", "MyThingsLab/my-raytracer", "--issue", "5", "--session-runner", "gemini"], capsys
+    )
+    in_fleet = StubCoder.instances[-1].kwargs["session_runner"]
+    assert "Bash(gh issue create*)" in in_fleet._allowed_tools
+
+    _build(["--repo", "someone-else/theirs", "--issue", "5", "--session-runner", "gemini"], capsys)
     out_of_fleet = StubCoder.instances[-1].kwargs["session_runner"]
     assert "Bash(gh issue create*)" not in out_of_fleet._allowed_tools
 
