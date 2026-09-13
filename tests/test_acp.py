@@ -71,3 +71,39 @@ def test_agent_context_pack_omitted_when_no_symbols_match(tmp_path: Path):
 
     prompt = coder._prompt(issue, git_repo.path)
     assert "## Deterministic Agent Context Pack" not in prompt
+
+
+def test_agent_context_pack_reads_from_graph_path_env(tmp_path: Path, monkeypatch):
+    calc_py = "def multiply_nums(a: int, b: int) -> int:\n    return a * b\n"
+    git_repo = make_git_repo(
+        tmp_path / "repo",
+        files={"src/sample/math.py": calc_py, "README.md": "# Math\n"},
+    )
+
+    # Pre-index to an external sqlite file
+    from mythings.graph import CodebaseGraph, PythonAstExtractor
+    external_db = tmp_path / "external_graph.sqlite"
+    graph = CodebaseGraph(external_db)
+    PythonAstExtractor(repo_root=git_repo.path).index_repo(graph)
+    graph.close()
+
+    monkeypatch.setenv("MYTHINGS_GRAPH_PATH", str(external_db))
+
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    coder = Coder(
+        ledger=ledger,
+        repo="MyThingsLab/sample-repo",
+        github=GitHub(runner=FakeGh()),
+        session_runner=NoopSessionRunner(),
+    )
+
+    issue = Issue(
+        number=10,
+        title="Improve multiply_nums performance",
+        body="multiply_nums should be optimized.",
+        url="https://github.com/MyThingsLab/sample-repo/issues/10",
+    )
+
+    prompt = coder._prompt(issue, git_repo.path)
+    assert "Agent Context Pack (ACP): multiply_nums" in prompt
+
