@@ -532,9 +532,17 @@ class Coder:
         primary_symbol = matched_symbols[0]
         try:
             acp = render_context_pack(graph, primary_symbol.id, repo_root=tree)
+            blast = graph.blast_radius(primary_symbol.id)
+            test_alert = ""
+            if not blast.tests:
+                test_alert = (
+                    f"⚠️ **Test Gap Alert**: Target symbol `{primary_symbol.name}` "
+                    "has no discovered unit tests in its blast radius.\n"
+                    "You are required to add test coverage for your changes in `tests/`.\n\n"
+                )
             return (
                 "## Deterministic Agent Context Pack (Grounded Focus & Blast Radius)\n\n"
-                f"{acp}\n\n"
+                f"{test_alert}{acp}\n\n"
             )
         except Exception:
             return ""
