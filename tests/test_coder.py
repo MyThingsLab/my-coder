@@ -1049,3 +1049,76 @@ def test_a_clean_worktree_after_a_failed_session_is_still_a_failure(
 
     assert result.outcome == "failure"
     assert result.files_touched == []
+
+
+def test_parse_test_failures_extracts_node_ids_and_traces():
+    from mycoder.coder import _parse_test_failures
+
+    stdout = """
+=================================== FAILURES ===================================
+__________________________________ test_one ___________________________________
+    def test_one():
+>       assert 1 == 2
+E       AssertionError: assert 1 == 2
+tests/test_foo.py:10: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_foo.py::test_one - AssertionError: assert 1 == 2
+FAILED tests/test_bar.py::test_two
+"""
+    failing, trace = _parse_test_failures(stdout, "")
+    assert failing == ["tests/test_foo.py::test_one", "tests/test_bar.py::test_two"]
+    assert "AssertionError: assert 1 == 2" in trace
+
+
+def test_build_records_failing_tests_and_passes_diagnostics_to_resuming_session(
+    tmp_path, clean_git_env, attended_env
+):
+    from mythings.ledger import Ledger
+
+    repo = make_git_repo(tmp_path)
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "broken"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/10",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    failing_script = (
+        "import sys\n"
+        "sys.stdout.write('FAILED tests/test_math.py::test_add - AssertionError: 1 != 2\\n')\n"
+        "sys.stdout.write('E   AssertionError: 1 != 2\\n')\n"
+        "sys.exit(1)\n"
+    )
+    first = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    coder1 = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        first,
+        run_tests=True,
+        test_command=[*_PY, "-c", failing_script],
+    )
+    first_result = coder1.run(issue_number=5)
+
+    assert first_result.outcome == "needs_review"
+    assert first_result.failing_tests == ["tests/test_math.py::test_add"]
+    assert "AssertionError: 1 != 2" in first_result.failure_trace
+
+    # Check ledger record
+    entries = list(Ledger(ledger_path))
+    last_entry = entries[-1]
+    assert last_entry.data["failing_tests"] == ["tests/test_math.py::test_add"]
+    assert "AssertionError: 1 != 2" in last_entry.data["failure_trace"]
+
+    # Second run resumes
+    second = FakeSessionRunner(files={"pkg/a.py": "a = 2\n"})
+    coder2 = _coder(repo.path, gh, ledger_path, second)
+    second_result = coder2.run(issue_number=5)
+
+    assert second_result.outcome == "success"
+    prompt = second.calls[0]
+    assert "Failing test(s): `tests/test_math.py::test_add`" in prompt
+    assert "AssertionError: 1 != 2" in prompt
+    assert "Files already modified:" in prompt
+    assert "pkg/a.py" in prompt
+    assert "Do NOT start over from scratch or repeat exploratory commands" in prompt

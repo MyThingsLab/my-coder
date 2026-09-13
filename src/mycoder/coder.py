@@ -214,6 +214,44 @@ class Result:
     cost_known: bool = True  # False once any attempt's true cost was unrecoverable
     attempts: int = 1
     blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
+    failing_tests: list[str] = field(default_factory=list)
+    failure_trace: str = ""
+
+
+@dataclass(frozen=True)
+class TestResult:
+    ok: bool
+    error: str | None = None
+    failing_tests: list[str] = field(default_factory=list)
+    failure_trace: str = ""
+
+
+def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
+    failing_tests: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("FAILED "):
+            parts = line.split()
+            if len(parts) >= 2:
+                node = parts[1]
+                if node not in failing_tests:
+                    failing_tests.append(node)
+
+    trace_lines = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("E   ") or "AssertionError" in stripped or "Error:" in stripped:
+            trace_lines.append(stripped)
+
+    if trace_lines:
+        failure_trace = "\n".join(trace_lines[:15])[:1000]
+    else:
+        combined = (stdout + "\n" + stderr).strip()
+        failure_trace = (
+            combined[-1000:] if combined else "Test command exited non-zero with no output"
+        )
+
+    return failing_tests, failure_trace
 
 
 def _parse_blocker(final_message: str) -> str | None:
@@ -330,16 +368,68 @@ class Coder:
             "Representative existing files:\n\n" + "\n\n".join(blocks)
         )
 
-    def _resume_note(self, prior_commits: int) -> str:
+    def _last_attempt_diagnostic(self, issue_number: int) -> dict[str, object] | None:
+        entries = [
+            e
+            for e in self.ledger
+            if e.tool == TOOL and e.kind == LEDGER_KIND and e.data.get("issue") == issue_number
+        ]
+        if not entries:
+            return None
+        last = entries[-1]
+        return {
+            "outcome": last.outcome,
+            "detail": last.detail,
+            "failing_tests": last.data.get("failing_tests", []),
+            "failure_trace": last.data.get("failure_trace", ""),
+            "final_message": last.data.get("final_message", ""),
+        }
+
+    def _resume_note(
+        self,
+        prior_commits: int,
+        *,
+        diff_stat: str = "",
+        diagnostic: dict[str, object] | None = None,
+    ) -> str:
         if prior_commits == 0:
             return ""
-        return (
+        parts = [
             f"This branch already carries {prior_commits} commit(s) from a prior attempt at "
             "this same issue -- an earlier run left them here instead of discarding them "
-            "(e.g. it failed the test suite, or was denied a PR). Inspect what's already "
-            "done with `git log` and `git diff`, keep what's good, and finish the job (fix a "
-            "failing test, complete a partial implementation) rather than starting over.\n\n"
-        )
+            "(e.g. it failed the test suite, or was denied a PR)."
+        ]
+        if diagnostic:
+            outcome = diagnostic.get("outcome")
+            if outcome:
+                parts.append(f"Prior attempt outcome: {outcome}.")
+            failing = diagnostic.get("failing_tests")
+            if isinstance(failing, list) and failing:
+                failing_str = ", ".join(f"`{t}`" for t in failing)
+                parts.append(f"- Failing test(s): {failing_str}")
+            trace = diagnostic.get("failure_trace")
+            if trace:
+                parts.append(f"- Error summary:\n```\n{trace}\n```")
+            final_msg = diagnostic.get("final_message")
+            if final_msg:
+                parts.append(f"- Prior worker note: {final_msg}")
+
+        if diff_stat:
+            parts.append(f"Files already modified:\n```\n{diff_stat}\n```")
+
+        if diagnostic and (diagnostic.get("failing_tests") or diagnostic.get("failure_trace")):
+            parts.append(
+                "⚠️ Do NOT start over from scratch or repeat exploratory commands. "
+                "Inspect the diff and test failure above, fix the root cause directly, "
+                "and ensure tests pass."
+            )
+        else:
+            parts.append(
+                "Inspect what's already done with `git log` and `git diff`, keep what's good, "
+                "and finish the job (fix a failing test, complete a partial implementation) "
+                "rather than starting over."
+            )
+        return "\n\n".join(parts) + "\n\n"
 
     def _relevant_files(self, tree: Path, issue: Issue) -> str:
         # my-searcher's own CLAUDE.md documents this exact hand-off: "a
@@ -391,7 +481,15 @@ class Coder:
             return True
         return self.repo_slug.split("/")[0] == FLEET_ORG
 
-    def _prompt(self, issue: Issue, tree: Path, *, prior_commits: int = 0) -> str:
+    def _prompt(
+        self,
+        issue: Issue,
+        tree: Path,
+        *,
+        prior_commits: int = 0,
+        diff_stat: str = "",
+        diagnostic: dict[str, object] | None = None,
+    ) -> str:
         fleet = self.in_fleet()
         conventions = self._conventions(tree)
         protocol = (
@@ -406,7 +504,9 @@ class Coder:
             number=issue.number,
             title=issue.title,
             body=issue.body or "(no description)",
-            resume_note=self._resume_note(prior_commits),
+            resume_note=self._resume_note(
+                prior_commits, diff_stat=diff_stat, diagnostic=diagnostic
+            ),
             relevant_files=self._relevant_files(tree, issue),
             research_context=self._research_context(issue),
             conventions=conventions,
@@ -493,7 +593,7 @@ class Coder:
         diff_text = self._git(tree, ["diff", "-U0", f"origin/{self.base}...{branch}"])
         return _secrets.scan_text(_secrets.added_lines(diff_text))
 
-    def _tests_pass(self, tree: Path) -> tuple[bool, str | None]:
+    def _tests_pass(self, tree: Path) -> TestResult:
         # A test command that cannot even be launched (no such interpreter, not
         # executable) is an operator misconfiguration, not a failing suite. It
         # used to raise out of _attempt and abort the run with a traceback,
@@ -502,8 +602,19 @@ class Coder:
         try:
             proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
         except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
-            return False, f"could not run test command {' '.join(self.test_command)!r}: {exc}"
-        return proc.returncode == 0, None
+            return TestResult(
+                ok=False,
+                error=f"could not run test command {' '.join(self.test_command)!r}: {exc}",
+            )
+        if proc.returncode == 0:
+            return TestResult(ok=True)
+        failing_tests, failure_trace = _parse_test_failures(proc.stdout, proc.stderr)
+        return TestResult(
+            ok=False,
+            error=None,
+            failing_tests=failing_tests,
+            failure_trace=failure_trace,
+        )
 
     def _pr_body(self, issue: Issue, files: list[str]) -> str:
         listed = "\n".join(f"- `{f}`" for f in files) or "- (none reported)"
@@ -586,9 +697,21 @@ class Coder:
             # still count as durable work even if this session adds nothing.
             base_sha = self._git(tree, ["merge-base", "HEAD", f"origin/{self.base}"]).strip()
             prior_commits = self._commit_count(tree, base_sha) if resuming else 0
+            diff_stat = (
+                self._git(tree, ["diff", "--stat", f"origin/{self.base}..HEAD"]).strip()
+                if resuming
+                else ""
+            )
+            diagnostic = self._last_attempt_diagnostic(issue.number) if resuming else None
 
             session = self.session_runner.run(
-                prompt=self._prompt(issue, tree, prior_commits=prior_commits),
+                prompt=self._prompt(
+                    issue,
+                    tree,
+                    prior_commits=prior_commits,
+                    diff_stat=diff_stat,
+                    diagnostic=diagnostic,
+                ),
                 cwd=tree,
                 max_budget_usd=self.max_budget_usd,
                 max_turns=self.max_turns,
@@ -713,18 +836,26 @@ class Coder:
                     cost_known=session.cost_usd is not None,
                 )
 
-            tests_ok, test_error = self._tests_pass(tree) if self.run_tests else (True, None)
-            if not tests_ok:
-                base_detail = test_error or (
+            test_res = self._tests_pass(tree) if self.run_tests else TestResult(ok=True)
+            if not test_res.ok:
+                base_detail = test_res.error or (
                     f"generated code for #{issue.number} failed the test suite"
                 )
+                if test_res.failing_tests:
+                    base_detail += f" ({', '.join(test_res.failing_tests)})"
                 push_error = self._push(tree, branch)
                 if push_error is not None:
                     # Nothing durable reached origin either -- this really is a
                     # loss, not a checkpoint.
                     detail = f"{base_detail}; checkpoint push also failed: {push_error}"
                     self._record(
-                        "failure", detail, files_touched=files, tests_passed=False, **common
+                        "failure",
+                        detail,
+                        files_touched=files,
+                        tests_passed=False,
+                        failing_tests=test_res.failing_tests,
+                        failure_trace=test_res.failure_trace,
+                        **common,
                     )
                     return Result(
                         "failure",
@@ -734,6 +865,8 @@ class Coder:
                         tests_passed=False,
                         cost_usd=billed_cost,
                         cost_known=session.cost_usd is not None,
+                        failing_tests=test_res.failing_tests,
+                        failure_trace=test_res.failure_trace,
                     )
                 detail = (
                     f"{base_detail}; branch {branch} pushed as a checkpoint -- "
@@ -745,6 +878,8 @@ class Coder:
                     files_touched=files,
                     tests_passed=False,
                     branch=branch,
+                    failing_tests=test_res.failing_tests,
+                    failure_trace=test_res.failure_trace,
                     **common,
                 )
                 return Result(
@@ -755,6 +890,8 @@ class Coder:
                     tests_passed=False,
                     cost_usd=billed_cost,
                     cost_known=session.cost_usd is not None,
+                    failing_tests=test_res.failing_tests,
+                    failure_trace=test_res.failure_trace,
                 )
             tests_passed: bool | None = True if self.run_tests else None
             # Ready when the suite actually ran and passed in this worktree;
