@@ -8,6 +8,7 @@ from mycoder.session import (
     ALLOWED_TOOLS,
     DENY_READS,
     ClaudeSessionRunner,
+    GeminiSessionRunner,
     NoopSessionRunner,
     _parse_result,
     allowed_tools,
@@ -338,3 +339,153 @@ def test_allowlist_closes_the_install_then_verify_loop() -> None:
     assert "Bash(.venv/bin/pip install*)" in ALLOWED_TOOLS
     assert "Bash(.venv/bin/python -m pytest*)" in ALLOWED_TOOLS
     assert "Bash(.venv/bin/ruff*)" in ALLOWED_TOOLS
+
+
+# --- GeminiSessionRunner tests --------------------------------------------
+
+_AGY_RESULT_LINE = (
+    '{"event":"result","result":{"status":"SUCCESS","response":"all done",'
+    '"num_turns":5,"usage":{"total_tokens":1234},"cost_usd":0.05}}\n'
+)
+
+
+def test_parse_result_reads_agy_event_result() -> None:
+    result = _parse_result(_AGY_RESULT_LINE)
+    assert result.cost == 0.05
+    assert result.turns == 5
+    assert result.final == "all done"
+    assert result.is_error is False
+    assert result.subtype == "SUCCESS"
+
+
+def test_parse_result_reads_agy_error_result() -> None:
+    line = (
+        '{"event":"result","result":{"status":"ERROR",'
+        '"response":"failed to execute","is_error":true}}\n'
+    )
+    result = _parse_result(line)
+    assert result.is_error is True
+    assert result.final == "failed to execute"
+    assert result.subtype == "ERROR"
+
+
+def test_parse_partial_reads_agy_step_updates() -> None:
+    stream = "\n".join(
+        [
+            '{"event":"init","init":{"cwd":"/tmp"}}',
+            (
+                '{"event":"step_update","step_update":{"step_index":1,"state":"DONE",'
+                '"step_type":"agent_response","usage":{"total_tokens":100}}}'
+            ),
+            (
+                '{"event":"step_update","step_update":{"step_index":2,"state":"DONE",'
+                '"step_type":"tool","usage":{"total_tokens":150}}}'
+            ),
+        ]
+    )
+    messages, tokens = parse_partial(stream)
+    assert messages == 2
+    assert tokens == 250
+
+
+def test_gemini_runner_parses_a_successful_session(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=_AGY_RESULT_LINE, stderr="")
+
+    runner = GeminiSessionRunner(bin_name="agy", runner=fake_run)
+    result = runner.run(
+        prompt="do it", cwd=tmp_path, max_budget_usd=5.0, max_turns=40, timeout_s=1800.0
+    )
+    assert result.ok is True
+    assert result.cost_usd == 0.05
+    assert result.turns == 5
+    assert result.final_message == "all done"
+    assert result.error is None
+    argv = calls[0]
+    assert argv[:3] == ["agy", "-p", "do it"]
+    assert "--output-format" in argv
+    assert "--dangerously-skip-permissions" in argv
+
+
+def test_gemini_runner_with_model_and_effort(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=_AGY_RESULT_LINE, stderr="")
+
+    runner = GeminiSessionRunner(
+        bin_name="gemini",
+        model="gemini-2.5-flash",
+        effort="high",
+        runner=fake_run,
+    )
+    runner.run(
+        prompt="build", cwd=tmp_path, max_budget_usd=1.0, max_turns=10, timeout_s=60.0
+    )
+    argv = calls[0]
+    assert "--model" in argv and argv[argv.index("--model") + 1] == "gemini-2.5-flash"
+    assert "--effort" in argv and argv[argv.index("--effort") + 1] == "high"
+    assert "--approval-mode" in argv and argv[argv.index("--approval-mode") + 1] == "yolo"
+
+
+def test_gemini_runner_reports_nonzero_exit_with_diagnosis(tmp_path: Path) -> None:
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Quota exceeded")
+
+    runner = GeminiSessionRunner(bin_name="gemini", runner=fake_run)
+    result = runner.run(
+        prompt="build", cwd=tmp_path, max_budget_usd=1.0, max_turns=10, timeout_s=60.0
+    )
+    assert result.ok is False
+    assert "gemini exited 1" in (result.error or "")
+    assert "Quota exceeded" in (result.error or "")
+
+
+def test_gemini_runner_handles_timeout(tmp_path: Path) -> None:
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0), output="partial agy log")
+
+    runner = GeminiSessionRunner(bin_name="agy", runner=fake_run)
+    result = runner.run(
+        prompt="build", cwd=tmp_path, max_budget_usd=1.0, max_turns=10, timeout_s=30.0
+    )
+    assert result.ok is False
+    assert "session exceeded 30s wall-clock timeout" in (result.error or "")
+    assert result.transcript == "partial agy log"
+
+
+def test_gemini_runner_redacts_credentials(tmp_path: Path) -> None:
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="auth failed for ghp_0123456789abcdefghijklmnopqrstuvwxyz"
+        )
+
+    runner = GeminiSessionRunner(bin_name="gemini", runner=fake_run)
+    result = runner.run(
+        prompt="build", cwd=tmp_path, max_budget_usd=1.0, max_turns=10, timeout_s=60.0
+    )
+    assert "ghp_0123456789abcdefghijklmnopqrstuvwxyz" not in (result.error or "")
+    assert result.leaked
+
+
+def test_child_env_sanitizes_gemini_and_preserves_config() -> None:
+    base = {
+        "GEMINI_CONFIG_DIR": "/home/bot/.gemini",
+        "GEMINI_CLI_BIN": "/usr/local/bin/agy",
+        "GEMINI_AGENT": "1",
+        "ANTIGRAVITY_AGENT": "1",
+        "GEMINI_CLI_TOKEN": "abc",
+        "PATH": "/usr/bin",
+    }
+    env = child_env(base)
+    assert env["GEMINI_CONFIG_DIR"] == "/home/bot/.gemini"
+    assert env["GEMINI_CLI_BIN"] == "/usr/local/bin/agy"
+    assert env["PATH"] == "/usr/bin"
+    assert "GEMINI_AGENT" not in env
+    assert "ANTIGRAVITY_AGENT" not in env
+    assert "GEMINI_CLI_TOKEN" not in env
+

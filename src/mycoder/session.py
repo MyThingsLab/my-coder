@@ -99,22 +99,22 @@ DENY_READS = [
     "Edit(**/dev-ledger/**)",
 ]
 
-# Non-config Claude-Code session markers. A worker session is itself a
-# `claude` subprocess; if it inherits these from a parent Claude Code session
-# it believes it is nested and routes every tool call through a permission
-# prompt that has no answerer, silently blocking all Bash — the session can
-# still edit files but can never run its tests or `git commit`, so it always
-# reports `no_changes`. Stripped from the child env; `CLAUDE_CONFIG_DIR` is
-# kept because it selects the account/identity the session runs under.
-_DROP_ENV = frozenset({"CLAUDECODE", "AI_AGENT"})
+# Non-config Claude-Code / Gemini session markers. A worker session is itself a
+# CLI subprocess; if it inherits these from a parent agent session it believes it
+# is nested and routes every tool call through a permission prompt that has no
+# answerer, silently blocking all execution. Stripped from the child env;
+# config dirs are kept because they select the account/identity the session runs under.
+_DROP_ENV = frozenset(
+    {"CLAUDECODE", "AI_AGENT", "GEMINI_AGENT", "ANTIGRAVITY_AGENT"}
+)
 
 
 def child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
     for key in list(env):
-        if key == "CLAUDE_CONFIG_DIR":
+        if key in ("CLAUDE_CONFIG_DIR", "GEMINI_CONFIG_DIR", "GEMINI_CLI_BIN"):
             continue
-        if key.startswith("CLAUDE_CODE_") or key in _DROP_ENV:
+        if key.startswith("CLAUDE_CODE_") or key.startswith("GEMINI_CLI_") or key in _DROP_ENV:
             del env[key]
     return env
 
@@ -160,17 +160,29 @@ def parse_partial(stdout: str) -> tuple[int, int]:
     # real turn ceiling is enforced by `--max-turns` inside claude.
     messages = tokens = 0
     for obj in _iter_objects(stdout):
-        if obj.get("type") != "assistant":
-            continue
-        messages += 1
-        usage = (obj.get("message") or {}).get("usage") or {}
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ):
-            tokens += int(usage.get(key) or 0)
+        if obj.get("type") == "assistant":
+            messages += 1
+            usage = (obj.get("message") or {}).get("usage") or {}
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                tokens += int(usage.get(key) or 0)
+        elif obj.get("event") == "step_update":
+            step = obj.get("step_update") or {}
+            step_type = step.get("step_type")
+            if step_type in ("agent_response", "tool"):
+                messages += 1
+            usage = step.get("usage") or {}
+            tokens += int(
+                usage.get("total_tokens")
+                or (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("output_tokens") or 0)
+                )
+            )
     return messages, tokens
 
 
@@ -188,16 +200,14 @@ class _Result:
     turns: int = 0
     final: str = ""
     is_error: bool = False
-    # claude's own name for *how* it ended -- "error_max_turns",
-    # "error_during_execution", "success". This is the field that separates
-    # "hit a limit" from "crashed", which have opposite fixes.
+    # The engine's own name for *how* it ended -- "error_max_turns",
+    # "error_during_execution", "success", "SUCCESS", etc.
     subtype: str = ""
 
 
 def _parse_result(stdout: str) -> _Result:
-    # claude's stream-json output ends on one `type=result` line carrying the
-    # settled cost / turn count / final reply; everything before it is
-    # incremental. A truncated or unparsable stream leaves the defaults.
+    # stream-json / json output ends on a result line carrying the settled cost /
+    # turn count / final reply. Handles Claude, Antigravity/Gemini, and generic envelopes.
     result = _Result()
     for obj in _iter_objects(stdout):
         if obj.get("type") == "result":
@@ -208,26 +218,46 @@ def _parse_result(stdout: str) -> _Result:
                 is_error=bool(obj.get("is_error", False)),
                 subtype=str(obj.get("subtype", "") or ""),
             )
+        elif obj.get("event") == "result" and isinstance(obj.get("result"), dict):
+            res = obj["result"]
+            status = str(res.get("status", "") or "")
+            is_error = bool(res.get("is_error", False)) or (bool(status) and status != "SUCCESS")
+            final = str(res.get("response") or res.get("result") or "")
+            turns = int(res.get("num_turns", 0) or 0)
+            cost = float(res.get("cost_usd", 0.0) or res.get("total_cost_usd", 0.0) or 0.0)
+            subtype = str(res.get("subtype") or status or "")
+            result = _Result(
+                cost=cost,
+                turns=turns,
+                final=final,
+                is_error=is_error,
+                subtype=subtype,
+            )
+        elif "status" in obj or "response" in obj:
+            status = str(obj.get("status", "") or "")
+            is_error = bool(obj.get("is_error", False)) or (bool(status) and status != "SUCCESS")
+            final = str(obj.get("response") or obj.get("result") or "")
+            turns = int(obj.get("num_turns", 0) or 0)
+            cost = float(obj.get("cost_usd", 0.0) or obj.get("total_cost_usd", 0.0) or 0.0)
+            subtype = str(obj.get("subtype") or status or "")
+            result = _Result(
+                cost=cost,
+                turns=turns,
+                final=final,
+                is_error=is_error,
+                subtype=subtype,
+            )
     return result
 
 
-def describe_failure(returncode: int, result: _Result, stderr: str) -> str:
-    """Build the one string a reader gets when a session ends badly.
-
-    `claude exited 1` is not a diagnosis: hitting the turn cap, hitting the
-    budget cap, crashing on a tool error and emitting something malformed all
-    render identically, and they have completely different fixes. Everything
-    that distinguishes them is already in hand at this point and was being
-    dropped -- claude's own `subtype`, its final message, and the process's
-    stderr, which is the only channel carrying a crash before the stream starts.
-    """
-    parts = [f"claude exited {returncode}"]
+def describe_failure(
+    returncode: int, result: _Result, stderr: str, *, engine_name: str = "claude"
+) -> str:
+    """Build the one string a reader gets when a session ends badly."""
+    parts = [f"{engine_name} exited {returncode}"]
     flags = [f for f in (result.subtype, "is_error" if result.is_error else "") if f]
     if flags:
         parts[0] += f" ({', '.join(flags)})"
-    # The final message is the model's own account of why it stopped; stderr is
-    # the runtime's. Either can be empty, and a crash early enough has only the
-    # latter, so neither alone is sufficient.
     for label, text in (("said", result.final), ("stderr", stderr)):
         collapsed = " ".join(text.split())
         if collapsed:
@@ -343,6 +373,97 @@ class ClaudeSessionRunner:
         error = None
         if not ok:
             error = describe_failure(proc.returncode, result, clean_stderr)
+        return SessionResult(
+            ok=ok,
+            turns=result.turns,
+            cost_usd=result.cost,
+            final_message=result.final,
+            transcript=clean,
+            leaked=sorted(set(leaked) | set(stderr_leaked)),
+            error=error,
+        )
+
+
+class GeminiSessionRunner:
+    # The headless session runner for Gemini / Antigravity CLI.
+    # Shells out to the configured CLI binary (GEMINI_CLI_BIN or agy/gemini),
+    # bounded three ways (spend/tokens, turns, and wall-clock timeout).
+    # `runner` is injected so tests never shell out to a real CLI.
+    def __init__(
+        self,
+        *,
+        bin_name: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        in_fleet: bool = True,
+    ) -> None:
+        self._bin_name = bin_name or os.environ.get("GEMINI_CLI_BIN", "agy")
+        self._model = model
+        self._effort = effort
+        self._runner = runner
+        self._allowed_tools = allowed_tools(in_fleet=in_fleet)
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        max_budget_usd: float,
+        max_turns: int,
+        timeout_s: float,
+    ) -> SessionResult:
+        base_name = Path(self._bin_name).name
+        argv = [
+            self._bin_name,
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+        ]
+        if "agy" in base_name or "antigravity" in base_name:
+            argv.append("--dangerously-skip-permissions")
+        elif "gemini" in base_name:
+            argv.extend(["--skip-trust", "--approval-mode", "yolo"])
+        if self._model:
+            argv.extend(["--model", self._model])
+        if self._effort:
+            argv.extend(["--effort", self._effort])
+
+        try:
+            proc = self._runner(
+                argv,
+                cwd=str(cwd),
+                env=child_env(),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raw = exc.stdout or ""
+            if isinstance(raw, bytes):
+                raw = raw.decode(errors="replace")
+            clean, leaked = redact_secrets(raw)
+            messages, tokens = parse_partial(clean)
+            return SessionResult(
+                ok=False,
+                turns=messages,
+                cost_usd=None,
+                tokens=tokens,
+                transcript=clean,
+                leaked=leaked,
+                error=f"session exceeded {timeout_s:.0f}s wall-clock timeout",
+            )
+
+        clean, leaked = redact_secrets(proc.stdout or "")
+        clean_stderr, stderr_leaked = redact_secrets(proc.stderr or "")
+        result = _parse_result(clean)
+        ok = proc.returncode == 0 and not result.is_error
+        error = None
+        if not ok:
+            error = describe_failure(
+                proc.returncode, result, clean_stderr, engine_name=base_name
+            )
         return SessionResult(
             ok=ok,
             turns=result.turns,

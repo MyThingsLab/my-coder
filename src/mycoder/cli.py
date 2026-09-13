@@ -11,7 +11,12 @@ from mythings.github import GitHub
 from mythings.ledger import Ledger
 
 from mycoder.coder import FLEET_ORG, Coder, Result, default_guarded_policy
-from mycoder.session import ClaudeSessionRunner, NoopSessionRunner, SessionRunner
+from mycoder.session import (
+    ClaudeSessionRunner,
+    GeminiSessionRunner,
+    NoopSessionRunner,
+    SessionRunner,
+)
 
 
 def _render(result: Result) -> str:
@@ -42,7 +47,11 @@ def _json(result: Result) -> str:
 
 
 def _runner(name: str, *, in_fleet: bool = True) -> SessionRunner:
-    return ClaudeSessionRunner(in_fleet=in_fleet) if name == "claude" else NoopSessionRunner()
+    if name == "claude":
+        return ClaudeSessionRunner(in_fleet=in_fleet)
+    if name == "gemini":
+        return GeminiSessionRunner(in_fleet=in_fleet)
+    return NoopSessionRunner()
 
 
 def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -> int:
@@ -60,9 +69,10 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
     build.add_argument("--base", default="main", help="base branch for the PR")
     build.add_argument(
         "--session-runner",
-        choices=("claude", "noop"),
+        choices=("claude", "gemini", "noop"),
         default="noop",
-        help="claude runs a real headless session; noop is a dry run (no change, no PR)",
+        help="claude runs a real headless session; gemini runs headless via gemini/agy CLI; "
+        "noop is a dry run (no change, no PR)",
     )
     build.add_argument("--max-budget-usd", type=float, default=5.0, help="session spend cap")
     build.add_argument(

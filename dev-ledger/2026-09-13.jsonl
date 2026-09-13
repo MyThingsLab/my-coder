@@ -1,0 +1,1 @@
+{"data":{"files":"src/mycoder/session.py,src/mycoder/cli.py,tests/test_session.py,tests/test_cli.py","session":"2026-09-13"},"detail":"Implement GeminiSessionRunner and multi-engine runner support in mycoder.session and CLI","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-09-13T13:19:57Z"}
