@@ -481,8 +481,17 @@ class Coder:
         except ImportError:
             return ""
 
-        cached_db = tree / ".mythings" / "graph.sqlite"
-        if cached_db.exists():
+        env_path = os.environ.get("MYTHINGS_GRAPH_PATH")
+        if env_path and Path(env_path).exists():
+            cached_db = Path(env_path)
+        elif (tree / ".mythings" / "graph.sqlite").exists():
+            cached_db = tree / ".mythings" / "graph.sqlite"
+        elif hasattr(self, "repo") and (self.repo / ".mythings" / "graph.sqlite").exists():
+            cached_db = self.repo / ".mythings" / "graph.sqlite"
+        else:
+            cached_db = None
+
+        if cached_db is not None:
             graph = CodebaseGraph(cached_db)
         else:
             graph = CodebaseGraph.in_memory()
