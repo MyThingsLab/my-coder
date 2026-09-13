@@ -39,6 +39,7 @@ def _json(result: Result) -> str:
             "pr": result.pr,
             "files_touched": result.files_touched,
             "tests_passed": result.tests_passed,
+            "tests_env": result.tests_env,
             "cost_usd": result.cost_usd,
             "attempts": result.attempts,
             "blocker": result.blocker,
@@ -109,7 +110,10 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         default=None,
         help="command --run-tests runs, as one shell-quoted string (default: pytest under the "
         "first interpreter found on PATH). Point this at a prepared environment when the "
-        "target repo's dependencies are not importable from the ambient interpreter",
+        "target repo's dependencies are not importable from the ambient interpreter -- "
+        "without it, a pass is reported as tests_env=ambient and the PR opens as a draft "
+        "even if tests_passed is true, since an ambient pass is not confirmed to match "
+        "what the target's CI installs",
     )
     build.add_argument(
         "--guarded",

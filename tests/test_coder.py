@@ -517,6 +517,7 @@ def test_a_verified_pr_opens_ready_not_draft(tmp_path, clean_git_env, attended_e
 
     assert result.outcome == "success"
     assert result.tests_passed is True
+    assert result.tests_env == "prepared"
     create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
     assert "--draft" not in create, "a PR whose suite passed must open ready, or CI never runs"
     entries = list(Ledger(ledger_path))
@@ -541,8 +542,41 @@ def test_an_unverified_pr_still_opens_as_a_draft(tmp_path, clean_git_env, attend
 
     assert result.outcome == "success"
     assert result.tests_passed is None
+    assert result.tests_env is None
     create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
     assert "--draft" in create
+
+
+def test_ambient_test_pass_still_opens_as_a_draft(
+    tmp_path, clean_git_env, attended_env, monkeypatch
+):
+    # my-coder#37: a suite that passes only because it ran under whatever
+    # interpreter `default_test_command` resolved from PATH -- my-coder's own
+    # ambient environment, not one the caller declared as matching the
+    # target's CI -- must not be reported as an unqualified green. Fix the
+    # default's resolved command to something that reliably passes (still
+    # exercised via test_command=None, the real "ambient" code path) and
+    # assert the PR still opens as a draft despite tests_passed being True.
+    monkeypatch.setattr("mycoder.coder.default_test_command", lambda: _PASSING_TEST_CMD)
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add greet"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/7",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/greet.py": "def greet():\n    return 'hi'\n"})
+    result = _coder(repo.path, gh, ledger_path, runner, run_tests=True).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.tests_passed is True
+    assert result.tests_env == "ambient"
+    assert "ambient" in result.detail
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" in create, "an ambient pass must not promote the PR to ready"
+    entries = list(Ledger(ledger_path))
+    assert any(e.kind == "code" and e.data.get("tests_env") == "ambient" for e in entries)
 
 
 def test_build_retries_and_succeeds_on_a_later_attempt(tmp_path, clean_git_env, attended_env):

@@ -186,7 +186,8 @@ def default_guarded_policy() -> Policy:
             Rule(
                 "draft-pr-needs-a-human",
                 Decision.ASK,
-                "opens a PR (ready when tests passed, draft otherwise)",
+                "opens a PR (ready when tests passed in a declared, CI-matching "
+                "environment; draft otherwise)",
                 kind=PR_ACTION_KIND,
             )
         ]
@@ -210,6 +211,12 @@ class Result:
     pr: int | None = None
     files_touched: list[str] = field(default_factory=list)
     tests_passed: bool | None = None
+    # "ambient" | "prepared" | None (--run-tests was off). Set whenever the
+    # suite actually ran, pass or fail, so a consumer can tell a pass verified
+    # against a declared, CI-matching environment from one that only proves
+    # the diff works against whatever my-coder's own interpreter happens to
+    # have installed (my-coder#37).
+    tests_env: str | None = None
     # Summed across every attempt, not just the last. An attempt whose real cost
     # could not be recovered (a timeout) contributes its budget cap here rather
     # than nothing, so this is a floor on spend, never an under-count.
@@ -328,6 +335,17 @@ class Coder:
         self.policy = policy or _AllowAll()
         self.base = base
         self.run_tests = run_tests
+        # Whether the caller named a command explicitly (per --test-command's
+        # own help text: "point this at a prepared environment when the
+        # target repo's dependencies are not importable from the ambient
+        # interpreter") or this fell back to whatever interpreter is first on
+        # PATH. The fallback is my-coder's own ambient environment as often
+        # as not -- e.g. a shared .venv with the target's core dependency
+        # installed editable from `main` -- which is not what the target's CI
+        # resolves. A pass there does not verify the diff against what CI
+        # will actually run, so it must not be reported as an unqualified
+        # green (my-coder#37).
+        self.tests_env = "ambient" if test_command is None else "prepared"
         self.test_command = test_command or default_test_command()
         self.max_budget_usd = max_budget_usd
         # A cap too low is indistinguishable from a real failure: a session that
@@ -878,6 +896,7 @@ class Coder:
                 )
 
             test_res = self._tests_pass(tree) if self.run_tests else TestResult(ok=True)
+            tests_env = self.tests_env if self.run_tests else None
             if not test_res.ok:
                 base_detail = test_res.error or (
                     f"generated code for #{issue.number} failed the test suite"
@@ -894,6 +913,7 @@ class Coder:
                         detail,
                         files_touched=files,
                         tests_passed=False,
+                        tests_env=tests_env,
                         failing_tests=test_res.failing_tests,
                         failure_trace=test_res.failure_trace,
                         **common,
@@ -904,6 +924,7 @@ class Coder:
                         issue=issue.number,
                         files_touched=files,
                         tests_passed=False,
+                        tests_env=tests_env,
                         cost_usd=billed_cost,
                         cost_known=session.cost_usd is not None,
                         failing_tests=test_res.failing_tests,
@@ -918,6 +939,7 @@ class Coder:
                     detail,
                     files_touched=files,
                     tests_passed=False,
+                    tests_env=tests_env,
                     branch=branch,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
@@ -929,23 +951,31 @@ class Coder:
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=False,
+                    tests_env=tests_env,
                     cost_usd=billed_cost,
                     cost_known=session.cost_usd is not None,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
                 )
             tests_passed: bool | None = True if self.run_tests else None
-            # Ready when the suite actually ran and passed in this worktree;
-            # draft otherwise. CI skips required checks on a draft, so a PR born
-            # as a draft can never show a green check -- and the fleet's
-            # promotion gate used to read that skip as a pass and promote on it
+            # Ready when the suite actually ran, passed, AND did so against an
+            # environment the caller declared via --test-command -- not just
+            # whatever interpreter my-coder's own default happened to find on
+            # PATH. CI skips required checks on a draft, so a PR born as a
+            # draft can never show a green check -- and the fleet's promotion
+            # gate used to read that skip as a pass and promote on it
             # (my-fleet#32). Opening ready is what makes CI run at all; the
             # human merge is the gate, not the promotion.
             #
             # `tests_passed is None` means --run-tests was off, so nothing was
-            # verified here. That stays a draft: unverified work should not
-            # present itself as reviewable.
-            verified = tests_passed is True
+            # verified here. `tests_env == "ambient"` means a suite did run and
+            # pass, but against my-coder's own default interpreter, which may
+            # carry dependencies the target's CI would never install (e.g. an
+            # editable core checkout where CI pins a release tag) -- an
+            # unqualified local green that will not necessarily reproduce in
+            # CI (my-coder#37). Both stay a draft: unverified or unqualified
+            # work should not present itself as reviewable.
+            verified = tests_passed is True and tests_env == "prepared"
 
             gate = self.policy.evaluate(
                 Action(
@@ -1023,13 +1053,21 @@ class Coder:
                     f"branch {branch} pushed for #{issue.number}, no PR — session ended "
                     f"early ({session.error}); resume or review the branch"
                 )
-                self._record("needs_review", detail, files_touched=files, branch=branch, **common)
+                self._record(
+                    "needs_review",
+                    detail,
+                    files_touched=files,
+                    branch=branch,
+                    tests_env=tests_env,
+                    **common,
+                )
                 return Result(
                     "needs_review",
                     detail,
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=tests_passed,
+                    tests_env=tests_env,
                     cost_usd=billed_cost,
                     cost_known=session.cost_usd is not None,
                 )
@@ -1049,13 +1087,21 @@ class Coder:
                     f"branch {branch} pushed for #{issue.number}, no PR — the diff contains "
                     f"possible secret(s) ({', '.join(patterns)}); scrub the branch and re-run"
                 )
-                self._record("needs_review", detail, files_touched=files, branch=branch, **common)
+                self._record(
+                    "needs_review",
+                    detail,
+                    files_touched=files,
+                    branch=branch,
+                    tests_env=tests_env,
+                    **common,
+                )
                 return Result(
                     "needs_review",
                     detail,
                     issue=issue.number,
                     files_touched=files,
                     tests_passed=tests_passed,
+                    tests_env=tests_env,
                     cost_usd=billed_cost,
                     cost_known=session.cost_usd is not None,
                 )
@@ -1069,23 +1115,37 @@ class Coder:
             )
 
         kind = "PR" if verified else "draft PR"
+        # A pass that isn't `verified` despite `tests_passed` is exactly the
+        # case my-coder#37 is about: green locally, but only against
+        # my-coder's own ambient interpreter, not a caller-declared
+        # environment. Say so in the record a human or the fleet reads,
+        # rather than reporting an unqualified "tests_passed: true".
+        ambient_note = (
+            " (tests passed, but only against the ambient interpreter -- not confirmed to "
+            "match the target's CI dependencies; pass --test-command to verify against a "
+            "declared environment before treating this as reviewable)"
+            if tests_passed is True and not verified
+            else ""
+        )
         self._record(
             "success",
-            f"opened {kind} #{pr.number} for #{issue.number}",
+            f"opened {kind} #{pr.number} for #{issue.number}{ambient_note}",
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
+            tests_env=tests_env,
             pr_url=pr.url,
             draft=not verified,
             **common,
         )
         return Result(
             "success",
-            f"opened {kind} #{pr.number}",
+            f"opened {kind} #{pr.number}{ambient_note}",
             issue=issue.number,
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
+            tests_env=tests_env,
             cost_usd=billed_cost,
             cost_known=session.cost_usd is not None,
         )

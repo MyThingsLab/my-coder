@@ -70,6 +70,26 @@ def test_build_json_output(capsys):
     assert payload["pr"] == 7
 
 
+def test_build_json_output_reports_the_tests_environment(capsys):
+    # my-coder#37: a consumer of the JSON result must be able to tell a pass
+    # verified against a caller-declared environment from one that only ran
+    # against my-coder's own ambient interpreter.
+    StubCoder.instances = []
+
+    class Ambient(StubCoder):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.result = Result(
+                "success", "ok", issue=5, pr=7, tests_passed=True, tests_env="ambient"
+            )
+
+    rc = main(["build", "--repo", "o/r", "--issue", "5", "--json"], coder_factory=Ambient)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["tests_passed"] is True
+    assert payload["tests_env"] == "ambient"
+
+
 def test_build_defaults_to_unguarded(capsys):
     _, coder, _ = _build(["--repo", "o/r", "--issue", "5"], capsys)
     assert coder.kwargs["policy"] is None
