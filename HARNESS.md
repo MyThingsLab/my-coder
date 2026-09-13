@@ -1,6 +1,6 @@
 # MyThingsLab build harness — rules for any My[X] tool
 
-You are an agent developing a MyThingsLab tool (Claude, Gemini, or other). These rules are inherited by
+You are an agent developing a MyThingsLab tool. These rules are inherited by
 **every** tool and backed by mechanical gates (ruff, pytest, CI, branch
 protection, MyGuard). The canonical copy ships in `mythings/harness.md`; inside a
 tool this is a **vendored copy** kept in sync by a drift-check test — never edit
