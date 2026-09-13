@@ -44,6 +44,7 @@ def _json(result: Result) -> str:
             "blocker": result.blocker,
             "failing_tests": result.failing_tests,
             "failure_trace": result.failure_trace,
+            "inherited_failures": result.inherited_failures,
         }
     )
 

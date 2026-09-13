@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -221,6 +222,11 @@ class Result:
     blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
     failing_tests: list[str] = field(default_factory=list)
     failure_trace: str = ""
+    # Tests that were already failing at the base commit, so they are not this
+    # diff's doing. Non-empty means the suite was red before the session ran
+    # and `tests_passed: False` is a statement about the repo, not the work
+    # (my-coder#34).
+    inherited_failures: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -724,8 +730,53 @@ class Coder:
             failure_trace=failure_trace,
         )
 
-    def _pr_body(self, issue: Issue, files: list[str]) -> str:
+    def _baseline_failures(self, tree: Path, base_sha: str) -> list[str] | None:
+        # What was already red before the session touched anything. Run the same
+        # command at the base commit, in a throwaway worktree of the same repo,
+        # so the comparison differs only by the diff. Returns None when no
+        # baseline could be established -- an unknown baseline must not be
+        # mistaken for a clean one, or an inherited red becomes "the diff broke
+        # it" again (my-coder#34).
+        #
+        # Only called when the post-session suite is red, so the common green
+        # path still costs exactly one suite run.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_tree = Path(tmp) / "base"
+            try:
+                self._git(tree, ["worktree", "add", "--detach", str(base_tree), base_sha])
+            except RuntimeError:
+                return None
+            try:
+                proc = subprocess.run(
+                    self.test_command, cwd=str(base_tree), capture_output=True, text=True
+                )
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                return None
+            finally:
+                try:
+                    self._git(tree, ["worktree", "remove", "--force", str(base_tree)])
+                except RuntimeError:
+                    pass
+        if proc.returncode == 0:
+            return []
+        failing, _ = _parse_test_failures(proc.stdout, proc.stderr)
+        # A red baseline whose failures could not be parsed into node ids is no
+        # more usable than no baseline at all: nothing can be subtracted.
+        return failing or None
+
+    def _pr_body(self, issue: Issue, files: list[str], inherited: list[str] | None = None) -> str:
         listed = "\n".join(f"- `{f}`" for f in files) or "- (none reported)"
+        inherited_section = ""
+        if inherited:
+            names = "\n".join(f"- `{t}`" for t in inherited)
+            inherited_section = (
+                "\n## Inherited test failures\n"
+                "These were already failing at the base commit — this diff did not cause "
+                "them, and no change in this PR can clear them:\n"
+                f"{names}\n\n"
+                "The suite is therefore red here, so this opens as a draft. Every test that "
+                "was green on base is still green.\n"
+            )
         return (
             f"Closes #{issue.number}.\n\n"
             "Implemented by MyCoder via a headless coding session.\n\n"
@@ -733,6 +784,7 @@ class Coder:
             "- [ ] scope matches the issue\n"
             "- [ ] tests green\n\n"
             f"## Files touched\n{listed}\n"
+            f"{inherited_section}"
         )
 
     def _persist_transcript(self, issue: Issue, transcript: str) -> str | None:
@@ -945,7 +997,32 @@ class Coder:
                 )
 
             test_res = self._tests_pass(tree) if self.run_tests else TestResult(ok=True)
-            if not test_res.ok:
+
+            # A red suite is only evidence against the diff if those same tests
+            # were green before it. Establish the base's failures and subtract
+            # them; what remains is what this session actually broke
+            # (my-coder#34). A launch error (test_res.error) is an operator
+            # misconfiguration, not a suite verdict, so there is nothing to
+            # subtract from.
+            inherited: list[str] = []
+            inherited_only = False
+            if not test_res.ok and test_res.error is None and test_res.failing_tests:
+                baseline = self._baseline_failures(tree, base_sha)
+                if baseline:
+                    already_red = set(baseline)
+                    inherited = [t for t in test_res.failing_tests if t in already_red]
+                    new_failures = [t for t in test_res.failing_tests if t not in already_red]
+                    # Nothing this diff touched went from green to red. Fall
+                    # through to the PR path rather than stranding the work:
+                    # one stale red would otherwise freeze a repo's autonomous
+                    # throughput permanently, since no session can fix a test
+                    # that was broken before it started. It still opens as a
+                    # draft -- the suite really is red, and that is a fact a
+                    # reviewer needs -- but the work becomes reviewable instead
+                    # of dying on a checkpoint branch nothing promotes.
+                    inherited_only = not new_failures
+
+            if not test_res.ok and not inherited_only:
                 base_detail = test_res.error or (
                     f"generated code for #{issue.number} failed the test suite"
                 )
@@ -988,6 +1065,7 @@ class Coder:
                     branch=branch,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
+                    inherited_failures=inherited,
                     **common,
                 )
                 return Result(
@@ -1000,8 +1078,13 @@ class Coder:
                     cost_known=session.cost_usd is not None,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
+                    inherited_failures=inherited,
                 )
             tests_passed: bool | None = True if self.run_tests else None
+            if inherited_only:
+                # The suite is red, just not because of this diff. Reporting
+                # this as a pass would claim a verification nobody performed.
+                tests_passed = False
             # Ready when the suite actually ran and passed in this worktree;
             # draft otherwise. CI skips required checks on a draft, so a PR born
             # as a draft can never show a green check -- and the fleet's
@@ -1129,30 +1212,41 @@ class Coder:
 
             pr = self.github.open_pr(
                 title=issue.title,
-                body=self._pr_body(issue, files),
+                body=self._pr_body(issue, files, inherited if inherited_only else None),
                 base=self.base,
                 head=branch,
                 draft=not verified,
             )
 
         kind = "PR" if verified else "draft PR"
+        # Why this is a draft matters to whoever reads the result: "the suite is
+        # red" and "the suite is red for reasons predating this branch" call for
+        # different follow-ups, and only the second one is unfixable from here.
+        inherited_note = (
+            f" — suite red only on tests already failing at base ({', '.join(inherited)}), "
+            "not caused by this diff"
+            if inherited_only
+            else ""
+        )
         self._record(
             "success",
-            f"opened {kind} #{pr.number} for #{issue.number}",
+            f"opened {kind} #{pr.number} for #{issue.number}{inherited_note}",
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
             pr_url=pr.url,
             draft=not verified,
+            inherited_failures=inherited,
             **common,
         )
         return Result(
             "success",
-            f"opened {kind} #{pr.number}",
+            f"opened {kind} #{pr.number}{inherited_note}",
             issue=issue.number,
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
             cost_usd=billed_cost,
             cost_known=session.cost_usd is not None,
+            inherited_failures=inherited if inherited_only else [],
         )

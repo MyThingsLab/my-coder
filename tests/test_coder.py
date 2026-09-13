@@ -1108,8 +1108,14 @@ def test_build_records_failing_tests_and_passes_diagnostics_to_resuming_session(
         }
     )
     ledger_path = tmp_path / "ledger.jsonl"
+    # Conditioned on the session's own file so this is a failure the *diff*
+    # caused. An unconditionally red script would also be red at the base
+    # commit, which is an inherited failure and no longer blamed on the diff
+    # (my-coder#34) -- a different case than the one this test is about.
     failing_script = (
-        "import sys\n"
+        "import pathlib, sys\n"
+        "if not pathlib.Path('pkg/a.py').exists():\n"
+        "    sys.exit(0)\n"
         "sys.stdout.write('FAILED tests/test_math.py::test_add - AssertionError: 1 != 2\\n')\n"
         "sys.stdout.write('E   AssertionError: 1 != 2\\n')\n"
         "sys.exit(1)\n"
@@ -1183,3 +1189,121 @@ def test_prune_python_exemplar_syntax_error_fallback():
     broken = "def broken(:::\n    some syntax error\n"
     pruned = _prune_python_exemplar(broken, max_chars=20)
     assert pruned == broken[:20]
+
+
+# A suite that is red at the base commit and stays red for the same reason: the
+# node id it reports does not depend on anything the session writes.
+_INHERITED_RED_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import sys; sys.stdout.write('FAILED tests/test_legacy.py::test_old - boom\\n'); sys.exit(1)",
+]
+
+# Green at base, red only once the session's file exists: a failure the diff
+# really did cause.
+_DIFF_BROKE_IT_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "if not pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.exit(0)\n"
+    "sys.stdout.write('FAILED tests/test_new.py::test_new - boom\\n')\n"
+    "sys.exit(1)\n",
+]
+
+# Red at base for one reason, and the diff adds a second, different failure.
+_BOTH_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "sys.stdout.write('FAILED tests/test_legacy.py::test_old - boom\\n')\n"
+    "if pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.stdout.write('FAILED tests/test_new.py::test_new - boom\\n')\n"
+    "sys.exit(1)\n",
+]
+
+
+def test_a_red_inherited_from_base_does_not_strand_the_work(
+    tmp_path, clean_git_env, attended_env
+):
+    # my-coder#34: --run-tests used to treat any red suite as the diff's fault.
+    # A repo carrying one unrelated failing test could therefore never produce a
+    # worker PR at all -- every session's work piled up on a checkpoint branch
+    # nothing promotes, and the retry loop paid again for a failure no session
+    # could fix. Subtracting the base's failures is what tells the two apart.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add a"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/11",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_RED_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 11
+    assert result.inherited_failures == ["tests/test_legacy.py::test_old"]
+    # Still not a verified pass -- the suite is genuinely red, so it opens as a
+    # draft and says why rather than claiming a green nobody observed.
+    assert result.tests_passed is False
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" in create
+    assert "tests/test_legacy.py::test_old" in result.detail
+
+
+def test_a_failure_the_diff_caused_is_still_the_diffs_fault(
+    tmp_path, clean_git_env, attended_env
+):
+    # The other half of the subtraction: a clean baseline means a red suite is
+    # exactly the evidence it always was, and needs_review (retryable) is right.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_DIFF_BROKE_IT_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.tests_passed is False
+    assert result.inherited_failures == []
+    assert not gh.saw("pr", "create")
+
+
+def test_a_new_failure_alongside_an_inherited_one_still_blames_the_diff(
+    tmp_path, clean_git_env, attended_env
+):
+    # An inherited red must not become a blanket amnesty: if the diff also broke
+    # something that was green on base, that is still the diff's fault.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_BOTH_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert not gh.saw("pr", "create")
+    # The inherited one is still named, so a reviewer is not sent chasing it.
+    assert result.inherited_failures == ["tests/test_legacy.py::test_old"]
+    assert "tests/test_new.py::test_new" in result.failing_tests
