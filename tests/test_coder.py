@@ -1307,3 +1307,131 @@ def test_a_new_failure_alongside_an_inherited_one_still_blames_the_diff(
     # The inherited one is still named, so a reviewer is not sent chasing it.
     assert result.inherited_failures == ["tests/test_legacy.py::test_old"]
     assert "tests/test_new.py::test_new" in result.failing_tests
+
+
+# Collection dies the same way at base and after the session: an environment
+# problem that predates the branch, not anything the diff did.
+_INHERITED_COLLECTION_ERROR_CMD = [
+    *_PY,
+    "-c",
+    "import sys\n"
+    "sys.stdout.write('ERROR tests/test_api.py - ModuleNotFoundError: No module named x\\n')\n"
+    "sys.exit(1)\n",
+]
+
+# Collects fine at base; only the session's file breaks the import.
+_DIFF_BROKE_COLLECTION_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "if not pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.exit(0)\n"
+    "sys.stdout.write('ERROR tests/test_api.py - ModuleNotFoundError: No module named x\\n')\n"
+    "sys.exit(1)\n",
+]
+
+# Inherited collection error, plus a real test failure the diff caused.
+_INHERITED_COLLECTION_PLUS_NEW_FAILURE_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "sys.stdout.write('ERROR tests/test_api.py - ModuleNotFoundError: No module named x\\n')\n"
+    "if pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.stdout.write('FAILED tests/test_new.py::test_new - boom\\n')\n"
+    "sys.exit(1)\n",
+]
+
+
+def test_a_collection_error_inherited_from_base_does_not_strand_the_work(
+    tmp_path, clean_git_env, attended_env
+):
+    # my-coder#50: a suite that dies at collection emits no FAILED lines, so
+    # there was nothing to subtract and #34's baseline never even ran. That is
+    # the case where stranding hurts most -- a repo that cannot be collected is
+    # entirely red, so no session could ever turn it green, and the retry loop
+    # paid for each attempt anyway.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add a"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/12",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_COLLECTION_ERROR_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 12
+    assert result.inherited_failures == ["tests/test_api.py"]
+    assert result.tests_passed is False
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" in create
+
+
+def test_a_collection_error_the_diff_introduced_is_still_the_diffs_fault(
+    tmp_path, clean_git_env, attended_env
+):
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_DIFF_BROKE_COLLECTION_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.tests_passed is False
+    assert result.inherited_failures == []
+    assert not gh.saw("pr", "create")
+
+
+def test_an_inherited_collection_error_does_not_excuse_a_new_failure(
+    tmp_path, clean_git_env, attended_env
+):
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_COLLECTION_PLUS_NEW_FAILURE_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert not gh.saw("pr", "create")
+    assert result.inherited_failures == ["tests/test_api.py"]
+    assert "tests/test_new.py::test_new" in result.failing_tests
+
+
+def test_parse_test_failures_harvests_collection_errors_but_not_the_banner():
+    from mycoder.coder import _parse_test_failures
+
+    stdout = (
+        "==================== ERRORS ====================\n"
+        "________ ERROR collecting tests/test_api.py ________\n"
+        "E   ModuleNotFoundError: No module named 'x'\n"
+        "=============== short test summary info ===============\n"
+        "ERROR tests/test_api.py - ModuleNotFoundError: No module named 'x'\n"
+        "FAILED tests/test_other.py::test_two - boom\n"
+    )
+    failing, trace = _parse_test_failures(stdout, "")
+    assert failing == ["tests/test_api.py", "tests/test_other.py::test_two"]
+    assert "collecting" not in failing
+    assert "ModuleNotFoundError" in trace

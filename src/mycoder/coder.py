@@ -241,12 +241,28 @@ def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
     failing_tests: list[str] = []
     for line in stdout.splitlines():
         line = line.strip()
-        if line.startswith("FAILED "):
+        # pytest's short summary names a failed test as "FAILED <nodeid>" and a
+        # module it could not even import as "ERROR <file>". Both name a target
+        # in the same position, so both can be subtracted against a base run
+        # (my-coder#50). Collection is where this matters most: it takes the
+        # whole suite down, so nothing in the repo can ever be green, and
+        # harvesting only FAILED lines left nothing to compare -- the run fell
+        # back to blaming the diff and retrying a condition no session can fix.
+        for prefix in ("FAILED ", "ERROR "):
+            if not line.startswith(prefix):
+                continue
             parts = line.split()
-            if len(parts) >= 2:
-                node = parts[1]
-                if node not in failing_tests:
-                    failing_tests.append(node)
+            if len(parts) < 2:
+                break
+            node = parts[1]
+            # "ERROR collecting tests/x.py" is the banner for the very error
+            # whose short-summary line we already harvest; taking "collecting"
+            # as a node id would make every collection error look identical.
+            if node == "collecting":
+                break
+            if node not in failing_tests:
+                failing_tests.append(node)
+            break
 
     trace_lines = []
     for line in stdout.splitlines():
