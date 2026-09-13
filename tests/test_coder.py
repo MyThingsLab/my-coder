@@ -1122,3 +1122,39 @@ def test_build_records_failing_tests_and_passes_diagnostics_to_resuming_session(
     assert "Files already modified:" in prompt
     assert "pkg/a.py" in prompt
     assert "Do NOT start over from scratch or repeat exploratory commands" in prompt
+
+
+def test_prune_python_exemplar_preserves_signatures_and_strips_bodies():
+    from mycoder.coder import _prune_python_exemplar
+
+    source = (
+        "from __future__ import annotations\n"
+        "import os\n"
+        "CONSTANT = 100\n\n"
+        "class Worker:\n"
+        "    field: int = 1\n\n"
+        "    def run(self, flag: bool) -> None:\n"
+        "        # heavy loop\n"
+        "        for i in range(100):\n"
+        "            print('doing heavy work')\n\n"
+        "def top_func(x: str) -> bool:\n"
+        "    return len(x) > 0\n"
+    )
+    pruned = _prune_python_exemplar(source)
+    assert "from __future__ import annotations" in pruned
+    assert "import os" in pruned
+    assert "CONSTANT = 100" in pruned
+    assert "class Worker:" in pruned
+    assert "field: int = 1" in pruned
+    assert "def run(self, flag: bool) -> None:" in pruned
+    assert "def top_func(x: str) -> bool:" in pruned
+    assert "doing heavy work" not in pruned
+    assert len(pruned) < len(source)
+
+
+def test_prune_python_exemplar_syntax_error_fallback():
+    from mycoder.coder import _prune_python_exemplar
+
+    broken = "def broken(:::\n    some syntax error\n"
+    pruned = _prune_python_exemplar(broken, max_chars=20)
+    assert pruned == broken[:20]
