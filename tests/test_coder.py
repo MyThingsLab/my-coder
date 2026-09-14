@@ -1129,6 +1129,17 @@ FAILED tests/test_bar.py::test_two
     assert "AssertionError: assert 1 == 2" in trace
 
 
+def test_parse_test_failures_extracts_collection_errors():
+    from mycoder.coder import _parse_test_failures
+
+    stdout = """
+=========================== short test summary info ============================
+ERROR tests/test_mcp_server.py - ModuleNotFoundError: No module named 'mcp'
+"""
+    failing, trace = _parse_test_failures(stdout, "")
+    assert failing == ["tests/test_mcp_server.py"]
+
+
 def test_build_records_failing_tests_and_passes_diagnostics_to_resuming_session(
     tmp_path, clean_git_env, attended_env
 ):
