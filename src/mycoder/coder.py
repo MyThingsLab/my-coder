@@ -213,6 +213,7 @@ class Result:
     pr: int | None = None
     files_touched: list[str] = field(default_factory=list)
     tests_passed: bool | None = None
+    supplied_test_command: bool = False
     # Summed across every attempt, not just the last. An attempt whose real cost
     # could not be recovered (a timeout) contributes its budget cap here rather
     # than nothing, so this is a floor on spend, never an under-count.
@@ -336,6 +337,7 @@ class Coder:
         self.policy = policy or _AllowAll()
         self.base = base
         self.run_tests = run_tests
+        self.supplied_test_command: bool = test_command is not None
         self.test_command = test_command or default_test_command()
         self.max_budget_usd = max_budget_usd
         # A cap too low is indistinguishable from a real failure: a session that
@@ -809,12 +811,16 @@ class Coder:
                 "The suite is therefore red here, so this opens as a draft. Every test that "
                 "was green on base is still green.\n"
             )
+        test_note = ""
+        if self.run_tests and self.supplied_test_command:
+            cmd_str = " ".join(self.test_command)
+            test_note = f" (verified via supplied --test-command: `{cmd_str}`)"
         return (
             f"Closes #{issue.number}.\n\n"
             "Implemented by MyCoder via a headless coding session.\n\n"
             "## Readiness\n"
             "- [ ] scope matches the issue\n"
-            "- [ ] tests green\n\n"
+            f"- [ ] tests green{test_note}\n\n"
             f"## Files touched\n{listed}\n"
             f"{inherited_section}"
         )
@@ -939,6 +945,7 @@ class Coder:
                 "tokens": session.tokens,
                 "final_message": session.final_message[:500],
                 "transcript": transcript_path,
+                "supplied_test_command": self.supplied_test_command if self.run_tests else False,
             }
 
             commits = self._commit_count(tree, base_sha)
@@ -1278,6 +1285,7 @@ class Coder:
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
+            supplied_test_command=self.supplied_test_command if self.run_tests else False,
             cost_usd=billed_cost,
             cost_known=session.cost_usd is not None,
             inherited_failures=inherited if inherited_only else [],

@@ -68,6 +68,7 @@ def test_build_json_output(capsys):
     payload = json.loads(out)
     assert payload["outcome"] == "success"
     assert payload["pr"] == 7
+    assert "supplied_test_command" in payload
 
 
 def test_build_defaults_to_unguarded(capsys):

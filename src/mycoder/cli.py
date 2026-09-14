@@ -39,6 +39,7 @@ def _json(result: Result) -> str:
             "pr": result.pr,
             "files_touched": result.files_touched,
             "tests_passed": result.tests_passed,
+            "supplied_test_command": result.supplied_test_command,
             "cost_usd": result.cost_usd,
             "attempts": result.attempts,
             "blocker": result.blocker,
