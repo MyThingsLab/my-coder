@@ -1307,3 +1307,13 @@ def test_a_new_failure_alongside_an_inherited_one_still_blames_the_diff(
     # The inherited one is still named, so a reviewer is not sent chasing it.
     assert result.inherited_failures == ["tests/test_legacy.py::test_old"]
     assert "tests/test_new.py::test_new" in result.failing_tests
+
+
+def test_test_env_prepends_worktree_src_to_pythonpath(tmp_path: Path, monkeypatch) -> None:
+    # #37: _test_env prepends the worktree's src directory to PYTHONPATH so tests run
+    # against the diff rather than an ambient editable install in the host venv.
+    monkeypatch.setenv("PYTHONPATH", "/ambient/path")
+    coder = _coder(tmp_path, FakeGh(), tmp_path / "ledger.jsonl", NoopSessionRunner())
+    env = coder._test_env(tmp_path)
+    assert env["PYTHONPATH"] == f"{tmp_path / 'src'}:/ambient/path"
+
