@@ -253,7 +253,7 @@ def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
     failing_tests: list[str] = []
     for line in stdout.splitlines():
         line = line.strip()
-        if line.startswith("FAILED "):
+        if line.startswith("FAILED ") or line.startswith("ERROR "):
             parts = line.split()
             if len(parts) >= 2:
                 node = parts[1]
