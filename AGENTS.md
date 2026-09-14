@@ -66,6 +66,11 @@ covered here defers to `HARNESS.md`, then `my-things-core/docs/CONVENTIONS.md`.
   session executes arbitrary code from the network inside its worktree.
   Revisit before running unattended against a repo whose dependency list is
   not trusted.
+- **Headless tool surface & built-ins:** `ALLOWED_TOOLS` governs tool invocations
+  of the gated kinds (`Bash`, `Read`, `Edit`, `Write`), while the headless process
+  additionally carries the harness built-ins. Prompt rules explicitly steer headless
+  workers away from backgrounding processes or scheduling wakeups that cannot complete
+  within the session's bounded wall clock.
 - **Backlog label:** `my-coder` (issues my-coder itself needs — bugs in the
   tool. It does not pick up arbitrary fleet backlog items; `my-orchestrator`
   picks those and hands them to my-coder as the worker.)
