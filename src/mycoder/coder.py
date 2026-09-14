@@ -511,19 +511,26 @@ class Coder:
         except ImportError:
             return ""
 
-        env_path = os.environ.get("MYTHINGS_GRAPH_PATH")
-        if env_path and Path(env_path).exists():
-            cached_db = Path(env_path)
-        elif (tree / ".mythings" / "graph.sqlite").exists():
-            cached_db = tree / ".mythings" / "graph.sqlite"
-        elif hasattr(self, "repo") and (self.repo / ".mythings" / "graph.sqlite").exists():
-            cached_db = self.repo / ".mythings" / "graph.sqlite"
-        else:
-            cached_db = None
+        # A cache written by an older extractor is worse than no cache: the
+        # current traversal discards edges in a format it no longer understands,
+        # and this pack then tells the worker the symbol has no callers and no
+        # tests -- which it reads as a finding, not as a stale index.
+        # `open_cached` returns None for absent, corrupt, or wrong-version.
+        candidates = [
+            Path(p)
+            for p in (
+                os.environ.get("MYTHINGS_GRAPH_PATH"),
+                tree / ".mythings" / "graph.sqlite",
+                (self.repo / ".mythings" / "graph.sqlite") if hasattr(self, "repo") else None,
+            )
+            if p
+        ]
+        graph = next(
+            (g for g in (CodebaseGraph.open_cached(p) for p in candidates) if g is not None),
+            None,
+        )
 
-        if cached_db is not None:
-            graph = CodebaseGraph(cached_db)
-        else:
+        if graph is None:
             graph = CodebaseGraph.in_memory()
             try:
                 PythonAstExtractor(repo_root=tree).index_repo(graph)
