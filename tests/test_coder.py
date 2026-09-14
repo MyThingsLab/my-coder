@@ -1360,3 +1360,10 @@ def test_default_test_command_has_supplied_test_command_false(
     assert coder.supplied_test_command is False
 
 
+def test_prompt_instructs_synchronous_execution() -> None:
+    from mycoder.coder import _PROMPT
+
+    assert "Run all commands synchronously" in _PROMPT
+    assert "Do NOT background commands" in _PROMPT
+
+

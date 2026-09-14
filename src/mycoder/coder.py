@@ -114,6 +114,10 @@ Rules:
 - Run the repo's own test suite and linter; leave them green. If its
   dependencies are missing from this checkout, install them first (the repo's
   own declared dependencies only) and then run the suite.
+- Run all commands synchronously. Do NOT background commands or use background
+  task polling/scheduling (such as ScheduleWakeup or TaskSearch) — your session is
+  bounded and running non-interactively; background processes and delayed wakeups
+  will not complete within your run.
 - Commit as you go, not once at the end. You are on a wall clock and may be
   killed mid-run; anything uncommitted at that moment is unverified work
   someone else has to review. Commit each coherent step as soon as it stands
