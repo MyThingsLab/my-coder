@@ -1059,7 +1059,32 @@ class Coder:
 
             test_res = self._tests_pass(tree) if self.run_tests else TestResult(ok=True)
             tests_env = self.tests_env if self.run_tests else None
-            if not test_res.ok:
+
+            # A red suite is only evidence against the diff if those same tests
+            # were green before it. Establish the base's failures and subtract
+            # them; what remains is what this session actually broke
+            # (my-coder#34). A launch error (test_res.error) is an operator
+            # misconfiguration, not a suite verdict, so there is nothing to
+            # subtract from.
+            inherited: list[str] = []
+            inherited_only = False
+            if not test_res.ok and test_res.error is None and test_res.failing_tests:
+                baseline = self._baseline_failures(tree, base_sha)
+                if baseline:
+                    already_red = set(baseline)
+                    inherited = [t for t in test_res.failing_tests if t in already_red]
+                    new_failures = [t for t in test_res.failing_tests if t not in already_red]
+                    # Nothing this diff touched went from green to red. Fall
+                    # through to the PR path rather than stranding the work:
+                    # one stale red would otherwise freeze a repo's autonomous
+                    # throughput permanently, since no session can fix a test
+                    # that was broken before it started. It still opens as a
+                    # draft -- the suite really is red, and that is a fact a
+                    # reviewer needs -- but the work becomes reviewable instead
+                    # of dying on a checkpoint branch nothing promotes.
+                    inherited_only = not new_failures
+
+            if not test_res.ok and not inherited_only:
                 base_detail = test_res.error or (
                     f"generated code for #{issue.number} failed the test suite"
                 )
@@ -1296,7 +1321,9 @@ class Coder:
             " (tests passed, but only against the ambient interpreter -- not confirmed to "
             "match the target's CI dependencies; pass --test-command to verify against a "
             "declared environment before treating this as reviewable)"
-            if tests_passed is True and not verified
+            if tests_passed is True and not verified and tests_env == "ambient"
+            else ""
+        )
         # Why this is a draft matters to whoever reads the result: "the suite is
         # red" and "the suite is red for reasons predating this branch" call for
         # different follow-ups, and only the second one is unfixable from here.
@@ -1308,8 +1335,7 @@ class Coder:
         )
         self._record(
             "success",
-            f"opened {kind} #{pr.number} for #{issue.number}{ambient_note}",
-            f"opened {kind} #{pr.number} for #{issue.number}{inherited_note}",
+            f"opened {kind} #{pr.number} for #{issue.number}{ambient_note}{inherited_note}",
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
@@ -1321,8 +1347,7 @@ class Coder:
         )
         return Result(
             "success",
-            f"opened {kind} #{pr.number}{ambient_note}",
-            f"opened {kind} #{pr.number}{inherited_note}",
+            f"opened {kind} #{pr.number}{ambient_note}{inherited_note}",
             issue=issue.number,
             pr=pr.number,
             files_touched=files,
