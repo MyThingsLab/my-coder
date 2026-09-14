@@ -227,6 +227,75 @@ def test_build_skips_when_issue_is_absent(tmp_path, clean_git_env, attended_env)
     assert not gh.saw("pr", "create")
 
 
+def test_verify_source_returns_none_when_origin_matches_repo(
+    tmp_path, clean_git_env, attended_env
+):
+    repo = make_git_repo(tmp_path)
+    repo.git("remote", "set-url", "origin", f"https://github.com/{SLUG}.git")
+    gh = FakeGh()
+    coder = _coder(repo.path, gh, tmp_path / "ledger.jsonl", NoopSessionRunner())
+
+    assert coder._verify_source() is None
+
+
+def test_verify_source_flags_a_mismatched_origin(tmp_path, clean_git_env, attended_env):
+    # my-coder#17: --source's origin pointed at my-coder's own checkout while
+    # --repo named my-raytracer. This used to be caught only by the paid
+    # session noticing it 8 turns in; it must now be a free, deterministic
+    # precondition.
+    repo = make_git_repo(tmp_path)
+    repo.git("remote", "set-url", "origin", "https://github.com/MyThingsLab/my-coder.git")
+    gh = FakeGh()
+    coder = _coder(repo.path, gh, tmp_path / "ledger.jsonl", NoopSessionRunner())
+
+    detail = coder._verify_source()
+
+    assert detail is not None
+    assert "MyThingsLab/my-coder" in detail
+    assert SLUG in detail
+    assert "--allow-source-mismatch" in detail
+
+
+def test_verify_source_allows_a_missing_origin_remote(tmp_path, clean_git_env, attended_env):
+    # The escape hatch for a checkout with no origin at all (e.g. made fresh
+    # just for this run) -- nothing to compare against, so nothing to refuse.
+    repo = make_git_repo(tmp_path)
+    repo.git("remote", "remove", "origin")
+    gh = FakeGh()
+    coder = _coder(repo.path, gh, tmp_path / "ledger.jsonl", NoopSessionRunner())
+
+    assert coder._verify_source() is None
+
+
+def test_build_skips_before_launching_a_session_when_source_origin_mismatches(
+    tmp_path, clean_git_env, attended_env
+):
+    repo = make_git_repo(tmp_path)
+    repo.git("remote", "set-url", "origin", "https://github.com/MyThingsLab/my-coder.git")
+    gh = FakeGh({("issue", "list"): _issue(5, "x")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(repo.path, gh, ledger_path, runner).run(issue_number=5)
+
+    assert result.outcome == "skipped"
+    assert "MyThingsLab/my-coder" in result.detail
+    assert runner.calls == []  # no session launched, nothing billed
+    assert not gh.saw("issue", "list")  # the issue lookup itself never ran
+    assert any(e.outcome == "skipped" for e in Ledger(ledger_path))
+
+
+def test_allow_source_mismatch_bypasses_the_precondition(tmp_path, clean_git_env, attended_env):
+    repo = make_git_repo(tmp_path)
+    repo.git("remote", "set-url", "origin", "https://github.com/MyThingsLab/my-coder.git")
+    gh = FakeGh({("issue", "list"): _issue(5, "noop")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    result = _coder(
+        repo.path, gh, ledger_path, NoopSessionRunner(), allow_source_mismatch=True
+    ).run(issue_number=5)
+
+    assert result.outcome == "no_changes"  # the escape hatch let the run proceed
+
+
 def test_build_blocked_when_session_reports_a_cross_repo_blocker(
     tmp_path, clean_git_env, attended_env
 ):
