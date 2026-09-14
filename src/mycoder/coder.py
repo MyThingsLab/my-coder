@@ -715,14 +715,34 @@ class Coder:
         diff_text = self._git(tree, ["diff", "-U0", f"origin/{self.base}...{branch}"])
         return _secrets.scan_text(_secrets.added_lines(diff_text))
 
+    def _test_env(self, tree: Path) -> dict[str, str]:
+        env = dict(os.environ)
+        src = str(tree / "src")
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            env["PYTHONPATH"] = f"{src}:{existing}"
+        else:
+            env["PYTHONPATH"] = src
+        return env
+
     def _tests_pass(self, tree: Path) -> TestResult:
         # A test command that cannot even be launched (no such interpreter, not
         # executable) is an operator misconfiguration, not a failing suite. It
         # used to raise out of _attempt and abort the run with a traceback,
         # discarding the session's committed work; report it as a verdict with
         # its own reason instead (my-coder#12).
+        #
+        # Set PYTHONPATH to the worktree's `src` so pytest imports this worktree's
+        # code under test rather than an ambient editable install in the host
+        # environment (my-coder#37).
         try:
-            proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
+            proc = subprocess.run(
+                self.test_command,
+                cwd=str(tree),
+                env=self._test_env(tree),
+                capture_output=True,
+                text=True,
+            )
         except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
             return TestResult(
                 ok=False,
@@ -756,7 +776,11 @@ class Coder:
                 return None
             try:
                 proc = subprocess.run(
-                    self.test_command, cwd=str(base_tree), capture_output=True, text=True
+                    self.test_command,
+                    cwd=str(base_tree),
+                    env=self._test_env(base_tree),
+                    capture_output=True,
+                    text=True,
                 )
             except (FileNotFoundError, NotADirectoryError, PermissionError):
                 return None
