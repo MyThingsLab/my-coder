@@ -1317,3 +1317,46 @@ def test_test_env_prepends_worktree_src_to_pythonpath(tmp_path: Path, monkeypatc
     env = coder._test_env(tmp_path)
     assert env["PYTHONPATH"] == f"{tmp_path / 'src'}:/ambient/path"
 
+
+def test_supplied_test_command_is_recorded_in_result_ledger_and_pr_body(
+    tmp_path: Path, clean_git_env, attended_env
+) -> None:
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add greet"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/7",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/greet.py": "def greet():\n    return 'hi'\n"})
+    cmd = [sys.executable, "-c", "exit(0)"]
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=cmd,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.tests_passed is True
+    assert result.supplied_test_command is True
+
+    entries = list(Ledger(ledger_path))
+    assert any(e.kind == "code" and e.data.get("supplied_test_command") is True for e in entries)
+
+    pr_call = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    body = pr_call[pr_call.index("--body") + 1]
+    assert "verified via supplied --test-command:" in body
+
+
+def test_default_test_command_has_supplied_test_command_false(
+    tmp_path: Path, clean_git_env, attended_env
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    coder = _coder(tmp_path, FakeGh(), ledger, NoopSessionRunner(), run_tests=True)
+    assert coder.supplied_test_command is False
+
+
