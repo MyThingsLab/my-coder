@@ -40,11 +40,13 @@ def _json(result: Result) -> str:
             "files_touched": result.files_touched,
             "tests_passed": result.tests_passed,
             "tests_env": result.tests_env,
+            "supplied_test_command": result.supplied_test_command,
             "cost_usd": result.cost_usd,
             "attempts": result.attempts,
             "blocker": result.blocker,
             "failing_tests": result.failing_tests,
             "failure_trace": result.failure_trace,
+            "inherited_failures": result.inherited_failures,
         }
     )
 

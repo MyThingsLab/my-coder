@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -91,6 +93,7 @@ Issue #{number}: {title}
 {body}
 
 {resume_note}\
+{context_pack}\
 {relevant_files}\
 {research_context}\
 {fleet_context}\
@@ -111,6 +114,10 @@ Rules:
 - Run the repo's own test suite and linter; leave them green. If its
   dependencies are missing from this checkout, install them first (the repo's
   own declared dependencies only) and then run the suite.
+- Run all commands synchronously. Do NOT background commands or use background
+  task polling/scheduling (such as ScheduleWakeup or TaskSearch) — your session is
+  bounded and running non-interactively; background processes and delayed wakeups
+  will not complete within your run.
 - Commit as you go, not once at the end. You are on a wall clock and may be
   killed mid-run; anything uncommitted at that moment is unverified work
   someone else has to review. Commit each coherent step as soon as it stands
@@ -217,6 +224,7 @@ class Result:
     # the diff works against whatever my-coder's own interpreter happens to
     # have installed (my-coder#37).
     tests_env: str | None = None
+    supplied_test_command: bool = False
     # Summed across every attempt, not just the last. An attempt whose real cost
     # could not be recovered (a timeout) contributes its budget cap here rather
     # than nothing, so this is a floor on spend, never an under-count.
@@ -226,6 +234,11 @@ class Result:
     blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
     failing_tests: list[str] = field(default_factory=list)
     failure_trace: str = ""
+    # Tests that were already failing at the base commit, so they are not this
+    # diff's doing. Non-empty means the suite was red before the session ran
+    # and `tests_passed: False` is a statement about the repo, not the work
+    # (my-coder#34).
+    inherited_failures: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -346,6 +359,7 @@ class Coder:
         # will actually run, so it must not be reported as an unqualified
         # green (my-coder#37).
         self.tests_env = "ambient" if test_command is None else "prepared"
+        self.supplied_test_command: bool = test_command is not None
         self.test_command = test_command or default_test_command()
         self.max_budget_usd = max_budget_usd
         # A cap too low is indistinguishable from a real failure: a session that
@@ -485,6 +499,78 @@ class Coder:
             )
         return "\n\n".join(parts) + "\n\n"
 
+    def _agent_context_pack(self, tree: Path, issue: Issue) -> str:
+        """Attempt to extract an Agent Context Pack (ACP) from the deterministic codebase graph."""
+        try:
+            from mythings.graph import (
+                CodebaseGraph,
+                MarkdownExtractor,
+                PythonAstExtractor,
+                render_context_pack,
+            )
+        except ImportError:
+            return ""
+
+        env_path = os.environ.get("MYTHINGS_GRAPH_PATH")
+        if env_path and Path(env_path).exists():
+            cached_db = Path(env_path)
+        elif (tree / ".mythings" / "graph.sqlite").exists():
+            cached_db = tree / ".mythings" / "graph.sqlite"
+        elif hasattr(self, "repo") and (self.repo / ".mythings" / "graph.sqlite").exists():
+            cached_db = self.repo / ".mythings" / "graph.sqlite"
+        else:
+            cached_db = None
+
+        if cached_db is not None:
+            graph = CodebaseGraph(cached_db)
+        else:
+            graph = CodebaseGraph.in_memory()
+            try:
+                PythonAstExtractor(repo_root=tree).index_repo(graph)
+                MarkdownExtractor(repo_root=tree).index_docs(graph)
+            except Exception:
+                return ""
+
+        text = f"{issue.title} {issue.body or ''}"
+        words = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", text))
+        matched_symbols = []
+        for w in words:
+            found = graph.find_symbols(w)
+            for s in found:
+                if s.kind in ("function", "method", "class"):
+                    matched_symbols.append(s)
+
+        if not matched_symbols:
+            return ""
+
+        title_lower = issue.title.lower()
+        matched_symbols.sort(
+            key=lambda s: (
+                s.name.lower() in title_lower,
+                s.kind != "class",
+                -(s.end_line or 0) + (s.start_line or 0),
+            ),
+            reverse=True,
+        )
+
+        primary_symbol = matched_symbols[0]
+        try:
+            acp = render_context_pack(graph, primary_symbol.id, repo_root=tree)
+            blast = graph.blast_radius(primary_symbol.id)
+            test_alert = ""
+            if not blast.tests:
+                test_alert = (
+                    f"⚠️ **Test Gap Alert**: Target symbol `{primary_symbol.name}` "
+                    "has no discovered unit tests in its blast radius.\n"
+                    "You are required to add test coverage for your changes in `tests/`.\n\n"
+                )
+            return (
+                "## Deterministic Agent Context Pack (Grounded Focus & Blast Radius)\n\n"
+                f"{test_alert}{acp}\n\n"
+            )
+        except Exception:
+            return ""
+
     def _relevant_files(self, tree: Path, issue: Issue) -> str:
         # my-searcher's own CLAUDE.md documents this exact hand-off: "a
         # reusable 'which files matter here' step for later tools (MyGroomer,
@@ -565,6 +651,7 @@ class Coder:
             resume_note=self._resume_note(
                 prior_commits, diff_stat=diff_stat, diagnostic=diagnostic
             ),
+            context_pack=self._agent_context_pack(tree, issue),
             relevant_files=self._relevant_files(tree, issue),
             research_context=self._research_context(issue),
             fleet_context=self._fleet_context(),
@@ -652,14 +739,34 @@ class Coder:
         diff_text = self._git(tree, ["diff", "-U0", f"origin/{self.base}...{branch}"])
         return _secrets.scan_text(_secrets.added_lines(diff_text))
 
+    def _test_env(self, tree: Path) -> dict[str, str]:
+        env = dict(os.environ)
+        src = str(tree / "src")
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            env["PYTHONPATH"] = f"{src}:{existing}"
+        else:
+            env["PYTHONPATH"] = src
+        return env
+
     def _tests_pass(self, tree: Path) -> TestResult:
         # A test command that cannot even be launched (no such interpreter, not
         # executable) is an operator misconfiguration, not a failing suite. It
         # used to raise out of _attempt and abort the run with a traceback,
         # discarding the session's committed work; report it as a verdict with
         # its own reason instead (my-coder#12).
+        #
+        # Set PYTHONPATH to the worktree's `src` so pytest imports this worktree's
+        # code under test rather than an ambient editable install in the host
+        # environment (my-coder#37).
         try:
-            proc = subprocess.run(self.test_command, cwd=str(tree), capture_output=True, text=True)
+            proc = subprocess.run(
+                self.test_command,
+                cwd=str(tree),
+                env=self._test_env(tree),
+                capture_output=True,
+                text=True,
+            )
         except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
             return TestResult(
                 ok=False,
@@ -675,15 +782,69 @@ class Coder:
             failure_trace=failure_trace,
         )
 
-    def _pr_body(self, issue: Issue, files: list[str]) -> str:
+    def _baseline_failures(self, tree: Path, base_sha: str) -> list[str] | None:
+        # What was already red before the session touched anything. Run the same
+        # command at the base commit, in a throwaway worktree of the same repo,
+        # so the comparison differs only by the diff. Returns None when no
+        # baseline could be established -- an unknown baseline must not be
+        # mistaken for a clean one, or an inherited red becomes "the diff broke
+        # it" again (my-coder#34).
+        #
+        # Only called when the post-session suite is red, so the common green
+        # path still costs exactly one suite run.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_tree = Path(tmp) / "base"
+            try:
+                self._git(tree, ["worktree", "add", "--detach", str(base_tree), base_sha])
+            except RuntimeError:
+                return None
+            try:
+                proc = subprocess.run(
+                    self.test_command,
+                    cwd=str(base_tree),
+                    env=self._test_env(base_tree),
+                    capture_output=True,
+                    text=True,
+                )
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                return None
+            finally:
+                try:
+                    self._git(tree, ["worktree", "remove", "--force", str(base_tree)])
+                except RuntimeError:
+                    pass
+        if proc.returncode == 0:
+            return []
+        failing, _ = _parse_test_failures(proc.stdout, proc.stderr)
+        # A red baseline whose failures could not be parsed into node ids is no
+        # more usable than no baseline at all: nothing can be subtracted.
+        return failing or None
+
+    def _pr_body(self, issue: Issue, files: list[str], inherited: list[str] | None = None) -> str:
         listed = "\n".join(f"- `{f}`" for f in files) or "- (none reported)"
+        inherited_section = ""
+        if inherited:
+            names = "\n".join(f"- `{t}`" for t in inherited)
+            inherited_section = (
+                "\n## Inherited test failures\n"
+                "These were already failing at the base commit — this diff did not cause "
+                "them, and no change in this PR can clear them:\n"
+                f"{names}\n\n"
+                "The suite is therefore red here, so this opens as a draft. Every test that "
+                "was green on base is still green.\n"
+            )
+        test_note = ""
+        if self.run_tests and self.supplied_test_command:
+            cmd_str = " ".join(self.test_command)
+            test_note = f" (verified via supplied --test-command: `{cmd_str}`)"
         return (
             f"Closes #{issue.number}.\n\n"
             "Implemented by MyCoder via a headless coding session.\n\n"
             "## Readiness\n"
             "- [ ] scope matches the issue\n"
-            "- [ ] tests green\n\n"
+            f"- [ ] tests green{test_note}\n\n"
             f"## Files touched\n{listed}\n"
+            f"{inherited_section}"
         )
 
     def _persist_transcript(self, issue: Issue, transcript: str) -> str | None:
@@ -806,6 +967,7 @@ class Coder:
                 "tokens": session.tokens,
                 "final_message": session.final_message[:500],
                 "transcript": transcript_path,
+                "supplied_test_command": self.supplied_test_command if self.run_tests else False,
             }
 
             commits = self._commit_count(tree, base_sha)
@@ -943,6 +1105,7 @@ class Coder:
                     branch=branch,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
+                    inherited_failures=inherited,
                     **common,
                 )
                 return Result(
@@ -956,6 +1119,7 @@ class Coder:
                     cost_known=session.cost_usd is not None,
                     failing_tests=test_res.failing_tests,
                     failure_trace=test_res.failure_trace,
+                    inherited_failures=inherited,
                 )
             tests_passed: bool | None = True if self.run_tests else None
             # Ready when the suite actually ran, passed, AND did so against an
@@ -964,6 +1128,14 @@ class Coder:
             # PATH. CI skips required checks on a draft, so a PR born as a
             # draft can never show a green check -- and the fleet's promotion
             # gate used to read that skip as a pass and promote on it
+            if inherited_only:
+                # The suite is red, just not because of this diff. Reporting
+                # this as a pass would claim a verification nobody performed.
+                tests_passed = False
+            # Ready when the suite actually ran and passed in this worktree;
+            # draft otherwise. CI skips required checks on a draft, so a PR born
+            # as a draft can never show a green check -- and the fleet's
+            # promotion gate used to read that skip as a pass and promote on it
             # (my-fleet#32). Opening ready is what makes CI run at all; the
             # human merge is the gate, not the promotion.
             #
@@ -1108,7 +1280,7 @@ class Coder:
 
             pr = self.github.open_pr(
                 title=issue.title,
-                body=self._pr_body(issue, files),
+                body=self._pr_body(issue, files, inherited if inherited_only else None),
                 base=self.base,
                 head=branch,
                 draft=not verified,
@@ -1125,27 +1297,39 @@ class Coder:
             "match the target's CI dependencies; pass --test-command to verify against a "
             "declared environment before treating this as reviewable)"
             if tests_passed is True and not verified
+        # Why this is a draft matters to whoever reads the result: "the suite is
+        # red" and "the suite is red for reasons predating this branch" call for
+        # different follow-ups, and only the second one is unfixable from here.
+        inherited_note = (
+            f" — suite red only on tests already failing at base ({', '.join(inherited)}), "
+            "not caused by this diff"
+            if inherited_only
             else ""
         )
         self._record(
             "success",
             f"opened {kind} #{pr.number} for #{issue.number}{ambient_note}",
+            f"opened {kind} #{pr.number} for #{issue.number}{inherited_note}",
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
             tests_env=tests_env,
             pr_url=pr.url,
             draft=not verified,
+            inherited_failures=inherited,
             **common,
         )
         return Result(
             "success",
             f"opened {kind} #{pr.number}{ambient_note}",
+            f"opened {kind} #{pr.number}{inherited_note}",
             issue=issue.number,
             pr=pr.number,
             files_touched=files,
             tests_passed=tests_passed,
             tests_env=tests_env,
+            supplied_test_command=self.supplied_test_command if self.run_tests else False,
             cost_usd=billed_cost,
             cost_known=session.cost_usd is not None,
+            inherited_failures=inherited if inherited_only else [],
         )

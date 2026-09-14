@@ -68,6 +68,7 @@ def test_build_json_output(capsys):
     payload = json.loads(out)
     assert payload["outcome"] == "success"
     assert payload["pr"] == 7
+    assert "supplied_test_command" in payload
 
 
 def test_build_json_output_reports_the_tests_environment(capsys):
