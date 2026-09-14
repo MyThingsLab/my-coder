@@ -1129,15 +1129,17 @@ FAILED tests/test_bar.py::test_two
     assert "AssertionError: assert 1 == 2" in trace
 
 
-def test_parse_test_failures_extracts_collection_errors():
+def test_parse_test_failures_also_harvests_collection_errors():
     from mycoder.coder import _parse_test_failures
 
     stdout = """
 =========================== short test summary info ============================
 ERROR tests/test_mcp_server.py - ModuleNotFoundError: No module named 'mcp'
+FAILED tests/test_foo.py::test_one - AssertionError: assert 1 == 2
 """
     failing, trace = _parse_test_failures(stdout, "")
-    assert failing == ["tests/test_mcp_server.py"]
+    assert failing == ["tests/test_mcp_server.py", "tests/test_foo.py::test_one"]
+    assert "ModuleNotFoundError: No module named 'mcp'" in trace
 
 
 def test_build_records_failing_tests_and_passes_diagnostics_to_resuming_session(
@@ -1262,6 +1264,47 @@ _BOTH_TEST_CMD = [
     "-c",
     "import pathlib, sys\n"
     "sys.stdout.write('FAILED tests/test_legacy.py::test_old - boom\\n')\n"
+    "if pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.stdout.write('FAILED tests/test_new.py::test_new - boom\\n')\n"
+    "sys.exit(1)\n",
+]
+
+# A suite that dies at collection, identically at base and after the session:
+# no "FAILED" line at all, just pytest's "ERROR" short-summary line naming the
+# file that failed to collect (my-coder#50).
+_INHERITED_COLLECTION_ERROR_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import sys\n"
+    "sys.stdout.write(\n"
+    "    'ERROR tests/test_mcp_server.py - ModuleNotFoundError: "
+    "No module named \\'mcp\\'\\n'\n"
+    ")\n"
+    "sys.exit(1)\n",
+]
+
+# Collects fine at base; the diff's file breaks collection.
+_DIFF_BROKE_COLLECTION_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "if not pathlib.Path('pkg/a.py').exists():\n"
+    "    sys.exit(0)\n"
+    "sys.stdout.write('ERROR tests/test_new.py - SyntaxError: boom\\n')\n"
+    "sys.exit(1)\n",
+]
+
+# A collection error inherited from base, plus a real test failure the diff
+# caused -- the inherited part is amnestied, the new one is still the diff's
+# fault.
+_COLLECTION_PLUS_NEW_FAILURE_TEST_CMD = [
+    *_PY,
+    "-c",
+    "import pathlib, sys\n"
+    "sys.stdout.write(\n"
+    "    'ERROR tests/test_mcp_server.py - ModuleNotFoundError: "
+    "No module named \\'mcp\\'\\n'\n"
+    ")\n"
     "if pathlib.Path('pkg/a.py').exists():\n"
     "    sys.stdout.write('FAILED tests/test_new.py::test_new - boom\\n')\n"
     "sys.exit(1)\n",
@@ -1412,3 +1455,84 @@ def test_prompt_instructs_synchronous_execution() -> None:
     assert "Do NOT background commands" in _PROMPT
 
 
+def test_a_collection_error_inherited_from_base_does_not_strand_the_work(
+    tmp_path, clean_git_env, attended_env
+):
+    # my-coder#50: a suite that dies at collection produces no "FAILED" lines,
+    # only pytest's "ERROR" short-summary line. Before this, that meant the
+    # baseline subtraction never even ran, so a collection error inherited from
+    # base was blamed on the diff forever -- no session can fix a suite that
+    # cannot be collected.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh(
+        {
+            ("issue", "list"): _issue(5, "add a"),
+            ("pr", "create"): f"https://github.com/{SLUG}/pull/11",
+        }
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_INHERITED_COLLECTION_ERROR_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "success"
+    assert result.pr == 11
+    assert result.inherited_failures == ["tests/test_mcp_server.py"]
+    assert result.tests_passed is False
+    create = next(c for c in gh.calls if c[:2] == ["pr", "create"])
+    assert "--draft" in create
+
+
+def test_a_collection_error_the_diff_introduced_is_still_the_diffs_fault(
+    tmp_path, clean_git_env, attended_env
+):
+    # The other half: base collects fine, the session's own file breaks
+    # collection -- that is still evidence against the diff, not an amnesty.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_DIFF_BROKE_COLLECTION_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert result.tests_passed is False
+    assert result.inherited_failures == []
+    assert not gh.saw("pr", "create")
+
+
+def test_a_new_failure_alongside_an_inherited_collection_error_still_blames_the_diff(
+    tmp_path, clean_git_env, attended_env
+):
+    # A collection error inherited from base does not amnesty a real failure
+    # the diff caused alongside it.
+    repo = make_git_repo(tmp_path, files={"README.md": "# r\n"})
+    gh = FakeGh({("issue", "list"): _issue(5, "add a")})
+    ledger_path = tmp_path / "ledger.jsonl"
+    runner = FakeSessionRunner(files={"pkg/a.py": "a = 1\n"})
+    result = _coder(
+        repo.path,
+        gh,
+        ledger_path,
+        runner,
+        run_tests=True,
+        test_command=_COLLECTION_PLUS_NEW_FAILURE_TEST_CMD,
+    ).run(issue_number=5)
+
+    assert result.outcome == "needs_review"
+    assert not gh.saw("pr", "create")
+    assert result.inherited_failures == ["tests/test_mcp_server.py"]
+    assert "tests/test_new.py::test_new" in result.failing_tests
+>>>>>>> 89cbab6 (fix(coder): harvest pytest ERROR lines so collection failures subtract too)
