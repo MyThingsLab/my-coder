@@ -201,6 +201,15 @@ def default_guarded_policy() -> Policy:
     )
 
 
+def _origin_slug(url: str) -> str | None:
+    # Matches both SSH (git@github.com:org/repo.git) and HTTPS
+    # (https://github.com/org/repo[.git]) remotes. Anything else (a local
+    # bare-repo path, a non-GitHub host) can't be compared, so callers must
+    # treat None as "unverifiable", not as a mismatch.
+    match = re.search(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$", url.strip())
+    return match.group(1) if match else None
+
+
 def _run_git(tree: Path, argv: list[str]) -> str:
     proc = subprocess.run(["git", "-C", str(tree), *argv], capture_output=True, text=True)
     if proc.returncode != 0:
@@ -337,6 +346,7 @@ class Coder:
         max_attempts: int = 1,
         max_total_budget_usd: float | None = None,
         transcripts_dir: Path | None = None,
+        allow_source_mismatch: bool = False,
         git: Callable[[Path, list[str]], str] = _run_git,
         workspace_factory: Callable[..., Workspace] = Workspace,
     ) -> None:
@@ -378,6 +388,7 @@ class Coder:
             max_total_budget_usd if max_total_budget_usd is not None else max_budget_usd * 3
         )
         self.transcripts_dir = Path(transcripts_dir) if transcripts_dir else None
+        self.allow_source_mismatch = allow_source_mismatch
         self._git = git
         self._workspace = workspace_factory
 
@@ -385,6 +396,30 @@ class Coder:
 
     def pick_issue(self, number: int) -> Issue | None:
         return next((i for i in self.github.list_issues() if i.number == number), None)
+
+    def _verify_source(self) -> str | None:
+        # The one part of the fleet's "never touches a repo other than the one
+        # named by the issue it was given" invariant that used to rest entirely
+        # on the session's own judgment (my-coder#17) -- a mismatch here would
+        # have branched a PR branch off the wrong repo before any session ran.
+        # Returns a detail string on a confirmed mismatch, None otherwise.
+        if not self.repo_slug or self.allow_source_mismatch:
+            return None
+        try:
+            url = self._git(self.repo, ["remote", "get-url", "origin"]).strip()
+        except RuntimeError:
+            # No origin remote at all -- e.g. a checkout made just for this run.
+            # Nothing to compare against, so there is nothing to refuse.
+            return None
+        origin_slug = _origin_slug(url)
+        if origin_slug is None or origin_slug.lower() == self.repo_slug.lower():
+            return None
+        return (
+            f"--source's origin remote ({url}) points at {origin_slug}, not --repo "
+            f"{self.repo_slug} -- refusing to run a session against the wrong repo. "
+            "If --source is intentionally a fork or otherwise differently named, pass "
+            "--allow-source-mismatch."
+        )
 
     def _repo_name(self) -> str:
         if self.repo_slug:
@@ -882,6 +917,11 @@ class Coder:
     _RETRYABLE = frozenset({"needs_review", "failure"})
 
     def run(self, issue_number: int) -> Result:
+        mismatch = self._verify_source()
+        if mismatch is not None:
+            self._record("skipped", mismatch, issue=issue_number)
+            return Result("skipped", mismatch, issue=issue_number)
+
         issue = self.pick_issue(issue_number)
         if issue is None:
             detail = f"no open issue #{issue_number} in {self.repo_slug or self._repo_name()}"

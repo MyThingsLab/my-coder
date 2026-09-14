@@ -39,7 +39,11 @@ explicit rather than implied:
   itself, wrapped as an `Action` through `Policy.evaluate` — with
   `--guarded`, that becomes a real ASK-channel approval a human answers.
 - **One PR per issue**, on head `mycoder/<repo>-<issue-number>`. It never
-  touches a repo other than the one its issue names.
+  touches a repo other than the one its issue names — enforced before any
+  session runs by checking that `--source`'s `origin` remote matches
+  `--repo`; a mismatch is `outcome=skipped` and costs nothing. `--source`
+  checkouts with no `origin`, or an intentionally different fork, need
+  `--allow-source-mismatch`.
 - **Dependency installs are allowed** — install subcommands only. A worktree
   carries only tracked files, so without this the target's suite is
   unrunnable and the worker would commit code it could not verify. This does

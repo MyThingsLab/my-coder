@@ -118,6 +118,12 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         "what the target's CI installs",
     )
     build.add_argument(
+        "--allow-source-mismatch",
+        action="store_true",
+        help="skip the precondition that --source's origin remote matches --repo -- "
+        "needed when --source is intentionally a fork or otherwise differently named",
+    )
+    build.add_argument(
         "--guarded",
         action="store_true",
         help="gate opening the draft PR through myguard.Guard (real ASK-channel human "
@@ -165,6 +171,7 @@ def main(argv: list[str] | None = None, *, coder_factory: type[Coder] = Coder) -
         max_attempts=args.max_attempts,
         max_total_budget_usd=args.max_total_budget_usd,
         transcripts_dir=transcripts_dir,
+        allow_source_mismatch=args.allow_source_mismatch,
     )
     result = coder.run(issue_number=args.issue)
     print(_json(result) if args.json else _render(result))
