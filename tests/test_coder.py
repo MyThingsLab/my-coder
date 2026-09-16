@@ -1535,4 +1535,3 @@ def test_a_new_failure_alongside_an_inherited_collection_error_still_blames_the_
     assert not gh.saw("pr", "create")
     assert result.inherited_failures == ["tests/test_mcp_server.py"]
     assert "tests/test_new.py::test_new" in result.failing_tests
->>>>>>> 89cbab6 (fix(coder): harvest pytest ERROR lines so collection failures subtract too)

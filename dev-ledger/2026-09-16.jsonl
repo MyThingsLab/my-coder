@@ -1,0 +1,1 @@
+{"data":{"files":"src/mycoder/coder.py,tests/test_coder.py,HARNESS.md","session":"2026-09-16"},"detail":"Resolve merge conflict with main and revendor HARNESS.md","kind":"fix","outcome":"success","tool":"claude-code","ts":"2026-09-16T09:43:12Z"}
