@@ -253,7 +253,14 @@ def _parse_test_failures(stdout: str, stderr: str) -> tuple[list[str], str]:
     failing_tests: list[str] = []
     for line in stdout.splitlines():
         line = line.strip()
-        if line.startswith("FAILED ") or line.startswith("ERROR "):
+        # "ERROR " is pytest's short-summary line for a collection-time error
+        # (bad import, missing dependency, syntax error in a test module) --
+        # it names a file in exactly the position "FAILED " names a node id, so
+        # it is harvested and subtracted the same way (my-coder#50). Without
+        # this, a suite that dies at collection reports no "FAILED" lines at
+        # all, the baseline subtraction never runs, and an inherited collection
+        # error is blamed on the diff every time.
+        if line.startswith(("FAILED ", "ERROR ")):
             parts = line.split()
             if len(parts) >= 2:
                 node = parts[1]

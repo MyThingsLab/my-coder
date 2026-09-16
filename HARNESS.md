@@ -39,10 +39,20 @@ re-vendor every copy: `python -m mythings._harness <workspace-root>`.
   `StrEnum`. No docstrings unless asked; comment only non-obvious *why*.
 
 ## Git, CI, and provenance
+- **Commit Schema**: `<type>(<scope>): <short imperative summary>` (e.g. `fix(ask): probe daemon on non-zero exit`).
+  - Types: `fix`, `feat`, `test`, `docs`, `chore`, `refactor`, `style`, `perf`, `ci`.
+  - Subject line in lower-case imperative mood, ≤ 72 chars, no trailing period.
+  - Body (optional) explains non-obvious rationale. Include `Closes #<issue-number>` and `Co-authored-by:` trailers.
+- **Issue Creation Schema**:
+  - Title: `<repo/area>: <imperative summary>` (e.g. `fleet: isolate DISPATCH_LEDGER in test fixtures`).
+  - Labels: Must assign all 5 CAD facets (`lane:`, `prio:`, `kind:`, `size:`, `state:`).
+  - Body Sections: Problem Statement / Context, Acceptance Criteria (checklist), Suggested Technical Seams, Related Issues.
+- **PR Drafting Schema**:
+  - Title: `<type>(<scope>): <short imperative summary>`.
+  - Body Sections: Summary of Changes, `Closes #<issue-number>`, Empirical Verification output (`pytest` & `ruff check` output), Safety Checklist.
+  - Open PRs as **draft**; mark ready only once the body's checklist holds *and* CI is green.
 - Commits: imperative subject, `Co-Authored-By` trailer. Never push unless asked.
 - The tool opens PRs; a human or a permission-scoped App merges. Never self-merge.
-- Open PRs as **draft**; mark ready only once the body's checklist holds *and*
-  CI is green.
 - CI is Linux-only, one job, with `concurrency: cancel-in-progress`, `paths-ignore`
   for docs, draft-PR skip, and a timeout. Do not add macOS/Windows runners.
 - Append a `dev-ledger/` entry via `python -m mythings._devledger` for each
